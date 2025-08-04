@@ -1,0 +1,11 @@
+{
+  "pairs": [
+    "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X",
+    "USDCHF=X", "USDCAD=X", "NZDUSD=X", "USDPLN=X",
+    "GC=F", "SI=F"
+  ],
+  "rsi_buy_threshold": 30,
+  "rsi_sell_threshold": 70,
+  "interval_minutes": 30,
+  "recipient_email": "mkgroup.zgora@gmail.com"
+}
