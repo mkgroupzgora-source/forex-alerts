@@ -1,101 +1,128 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from ta.momentum import RSIIndicator
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import feedparser
 import datetime
-import time
+import feedparser
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import requests
+from bs4 import BeautifulSoup
 
-analyzer = SentimentIntensityAnalyzer()
+st.set_page_config(page_title="SEP Forex Signals", layout="centered")
 
-assets = [
-    "EURUSD", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD",
-    "XAUUSD", "XAGUSD", "WTIUSD", "BrentUSD",
-    "BTCUSD", "USDPLN"
-]
-
-rss_feeds = {
-    "EURUSD": ["https://www.investing.com/rss/news_25.rss"],
-    "AUDUSD": ["https://www.investing.com/rss/news_25.rss"],
-    "USDCHF": ["https://www.investing.com/rss/news_25.rss"],
-    "USDCAD": ["https://www.investing.com/rss/news_25.rss"],
-    "NZDUSD": ["https://www.investing.com/rss/news_25.rss"],
-    "XAUUSD": ["https://www.investing.com/rss/news_301.rss"],
-    "XAGUSD": ["https://www.investing.com/rss/news_301.rss"],
-    "WTIUSD": ["https://www.investing.com/rss/news_92.rss"],
-    "BrentUSD": ["https://www.investing.com/rss/news_92.rss"],
-    "BTCUSD": ["https://www.investing.com/rss/news_301.rss"],
-    "USDPLN": ["https://www.investing.com/rss/news_25.rss"]
+# Mapa tickerów Yahoo Finance
+symbol_map = {
+    "EURUSD": "EURUSD=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCHF": "USDCHF=X",
+    "USDCAD": "CAD=X",
+    "NZDUSD": "NZDUSD=X",
+    "XAUUSD": "XAUUSD=X",
+    "XAGUSD": "XAGUSD=X",
+    "WTIUSD": "CL=F",
+    "BrentUSD": "BZ=F",
+    "BTCUSD": "BTC-USD",
+    "USDPLN": "USDPLN=X"
 }
 
-def get_rsi_signal(symbol):
-    try:
-        df = yf.download(symbol, period="7d", interval="1h", progress=False)
-        if df.empty or len(df) < 15:
-            return None, "Brak danych"
-        df.dropna(inplace=True)
-        rsi = RSIIndicator(df["Close"]).rsi().iloc[-1]
-        if rsi < 30:
-            return rsi, "Kupno"
-        elif rsi > 70:
-            return rsi, "Sprzedaż"
-        else:
-            return rsi, "Brak sygnału"
-    except Exception as e:
-        return None, "Błąd"
+# Funkcja RSI
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=window).mean()
+    avg_loss = loss.rolling(window=window).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-def get_news_sentiment(feed_urls):
-    news_items = []
-    try:
-        for url in feed_urls:
+# Funkcja określająca sygnał
+def get_rsi_signal(rsi):
+    if pd.isna(rsi):
+        return "Brak danych"
+    elif rsi < 30:
+        return "KUP"
+    elif rsi > 70:
+        return "SPRZEDAJ"
+    else:
+        return "BRAK SYGNAŁU"
+
+# Funkcja do analizy sentymentu VADER
+def analyze_sentiment(text):
+    analyzer = SentimentIntensityAnalyzer()
+    score = analyzer.polarity_scores(text)
+    if score['compound'] >= 0.05:
+        return "Pozytywny"
+    elif score['compound'] <= -0.05:
+        return "Negatywny"
+    else:
+        return "Neutralny"
+
+# Funkcja do pobierania newsów RSS
+def get_news():
+    urls = {
+        "Investing": "https://www.investing.com/rss/news_25.rss",
+        "ForexFactory": "https://www.forexfactory.com/news.atom",
+        "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/"
+    }
+
+    all_news = []
+
+    for source, url in urls.items():
+        try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
+            for entry in feed.entries[:10]:
                 title = entry.title
-                link = entry.link
-                score = analyzer.polarity_scores(title)['compound']
-                sentiment = "Pozytywny" if score > 0.2 else "Negatywny" if score < -0.2 else "Neutralny"
-                news_items.append({
-                    "tytuł": title,
-                    "link": link,
-                    "sentyment": sentiment
+                published = entry.get("published", "")
+                sentiment = analyze_sentiment(title)
+                all_news.append({
+                    "Źródło": source,
+                    "Tytuł": title,
+                    "Data": published,
+                    "Sentyment": sentiment
                 })
-        return news_items
-    except Exception as e:
-        return []
+        except Exception as e:
+            all_news.append({"Źródło": source, "Tytuł": f"Błąd: {e}", "Data": "", "Sentyment": "Brak"})
 
+    return pd.DataFrame(all_news)
+
+# Główna funkcja
 def main():
     st.title("📈 SEP Forex Signals")
-    st.subheader("Analiza RSI + NLP (VADER) + przypisane newsy do aktywów.")
+    st.markdown("Analiza RSI + NLP (VADER) + przypisane newsy do aktywów.")
     if st.button("🔄 Odśwież dane teraz"):
         st.rerun()
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(f"Ostatnia aktualizacja: **{now}**")
 
-    st.subheader("📊 Sygnały RSI")
+    rsi_data = []
 
-    signals = []
-    for asset in assets:
-        rsi, signal = get_rsi_signal(asset)
-        signals.append({
+    for asset, ticker in symbol_map.items():
+        try:
+            df = yf.download(ticker, period="1mo", interval="1d")
+            if df.empty:
+                rsi = None
+            else:
+                df['RSI'] = calculate_rsi(df)
+                rsi = df['RSI'].iloc[-1]
+            signal = get_rsi_signal(rsi)
+        except Exception:
+            rsi = None
+            signal = "BŁĄD"
+
+        rsi_data.append({
             "Aktywum": asset,
-            "RSI": round(rsi, 2) if rsi else "None",
+            "RSI": round(rsi, 2) if rsi else None,
             "Sygnał": signal,
-            "Godzina": now[-8:]
+            "Godzina": now.split(" ")[1]
         })
 
-    st.dataframe(pd.DataFrame(signals))
+    st.subheader("📊 Sygnały RSI")
+    st.dataframe(pd.DataFrame(rsi_data))
 
-    st.subheader("📰 Ważne wiadomości")
-    for asset in assets:
-        st.markdown(f"#### {asset}")
-        news = get_news_sentiment(rss_feeds.get(asset, []))
-        if not news:
-            st.write("Brak newsów lub błąd pobierania.")
-            continue
-        for item in news:
-            st.markdown(f"- [{item['tytuł']}]({item['link']}) – *{item['sentyment']}*")
+    st.subheader("📰 Ważne wiadomości (Investing, ForexFactory, MarketWatch)")
+    news_df = get_news()
+    st.dataframe(news_df)
 
 if __name__ == "__main__":
     main()
