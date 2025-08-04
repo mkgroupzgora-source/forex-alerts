@@ -1,7 +1,7 @@
 streamlit
 yfinance
 pandas
-ta
+git+https://github.com/bukosabino/ta.git
 vaderSentiment
 requests
 beautifulsoup4
