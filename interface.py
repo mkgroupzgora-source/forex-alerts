@@ -68,7 +68,7 @@ def main():
     st.title("📈 SEP Forex Signals")
     st.subheader("Analiza RSI + NLP (VADER) + przypisane newsy do aktywów.")
     if st.button("🔄 Odśwież dane teraz"):
-    st.rerun()
+        st.rerun()
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(f"Ostatnia aktualizacja: **{now}**")
