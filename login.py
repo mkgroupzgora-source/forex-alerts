@@ -8,7 +8,7 @@ def login():
     if st.button("Zaloguj"):
         if username == "sepuser" and password == "sep2025":
             st.session_state["authenticated"] = True
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Nieprawidłowe dane logowania")
 
