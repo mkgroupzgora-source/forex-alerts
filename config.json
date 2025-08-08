@@ -31,8 +31,6 @@
   "ui": {
     "auto_refresh_minutes": 30
   },
-  "interval_minutes": 30
-}
-    "auto_refresh_minutes": 30
-  }
+  "interval_minutes": 30,
+  "recipient_email": "mkgroup.zgora@gmail.com"
 }
