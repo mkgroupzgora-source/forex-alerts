@@ -1,11 +1,12 @@
-{
-  "pairs": [
-    "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X",
-    "USDCHF=X", "USDCAD=X", "NZDUSD=X", "USDPLN=X",
-    "GC=F", "SI=F"
-  ],
-  "rsi_buy_threshold": 30,
-  "rsi_sell_threshold": 70,
-  "interval_minutes": 30,
-  "recipient_email": "mkgroup.zgora@gmail.com"
-}
+RSI_BUY = 30
+RSI_SELL = 70
+
+TRAILING_STOP_PIPS = 10
+TRAILING_TRIGGER_PIPS = 10
+
+SYMBOLS = [
+    "EURUSD", "GBPUSD", "USDCHF", "USDJPY", "USDCNH", "USDRUB", "AUDUSD", "NZDUSD", "USDCAD", "USDSEK", "USDPLN",
+    "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "AUDPLN", "CADCHF", "CADJPY", "CADPLN", "CHFJPY", "CHFPLN", "CNHJPY",
+    "EURAUD", "EURCAD", "EURCHF", "EURCNH", "EURGBP", "EURJPY", "EURNZD", "EURPLN", "GBPAUD", "GBPCAD", "GBPCHF",
+    "GBPJPY", "GBPPLN", "XAGUSD", "XAUUSD", "XPDUSD", "XPTUSD"
+]
