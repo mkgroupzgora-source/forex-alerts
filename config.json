@@ -1,12 +1,38 @@
-RSI_BUY = 30
-RSI_SELL = 70
+{
+  "timezone": "Europe/Warsaw",
 
-TRAILING_STOP_PIPS = 10
-TRAILING_TRIGGER_PIPS = 10
+  "symbols": [
+    "EURUSD","GBPUSD","USDCHF","USDJPY","USDCNH","USDRUB","AUDUSD","NZDUSD","USDCAD",
+    "USDSEK","USDPLN","AUDCAD","AUDCHF","AUDJPY","AUDNZD","AUDPLN","CADCHF","CADJPY",
+    "CADPLN","CHFJPY","CHFPLN","CNHJPY","EURAUD","EURCAD","EURCHF","EURCNH","EURGBP",
+    "EURJPY","EURNZD","EURPLN","GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPPLN",
+    "XAGUSD","XAUUSD","XPDUSD","XPTUSD"
+  ],
 
-SYMBOLS = [
-    "EURUSD", "GBPUSD", "USDCHF", "USDJPY", "USDCNH", "USDRUB", "AUDUSD", "NZDUSD", "USDCAD", "USDSEK", "USDPLN",
-    "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "AUDPLN", "CADCHF", "CADJPY", "CADPLN", "CHFJPY", "CHFPLN", "CNHJPY",
-    "EURAUD", "EURCAD", "EURCHF", "EURCNH", "EURGBP", "EURJPY", "EURNZD", "EURPLN", "GBPAUD", "GBPCAD", "GBPCHF",
-    "GBPJPY", "GBPPLN", "XAGUSD", "XAUUSD", "XPDUSD", "XPTUSD"
-]
+  "intervals": ["15m", "30m", "60m"],
+
+  "rsi": {
+    "period": 14,
+    "buy": 30,
+    "sell": 70
+  },
+
+  "trailing": {
+    "trigger_pips": 10,
+    "trail_pips": 10
+  },
+
+  "news": {
+    "sources": ["Investing", "ForexFactory", "MarketWatch"]
+  },
+
+  "mt5": {
+    "login": 0,
+    "password": "",
+    "server": ""
+  },
+
+  "ui": {
+    "auto_refresh_minutes": 30
+  }
+}
