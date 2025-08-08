@@ -1,21 +1,39 @@
 {
   "timezone": "Europe/Warsaw",
 
-  "symbols": [
-    "EURUSD","GBPUSD","USDCHF","USDJPY","USDCNH","USDRUB","AUDUSD","NZDUSD","USDCAD",
-    "USDSEK","USDPLN","AUDCAD","AUDCHF","AUDJPY","AUDNZD","AUDPLN","CADCHF","CADJPY",
-    "CADPLN","CHFJPY","CHFPLN","CNHJPY","EURAUD","EURCAD","EURCHF","EURCNH","EURGBP",
-    "EURJPY","EURNZD","EURPLN","GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPPLN",
+  "pairs": [
+    "EURUSD","GBPUSD","USDCHF","USDJPY","USDCNH","USDRUB",
+    "AUDUSD","NZDUSD","USDCAD","USDSEK","USDPLN",
+    "AUDCAD","AUDCHF","AUDJPY","AUDNZD","AUDPLN",
+    "CADCHF","CADJPY","CADPLN",
+    "CHFJPY","CHFPLN","CNHJPY",
+    "EURAUD","EURCAD","EURCHF","EURCNH","EURGBP","EURJPY",
+    "EURNZD","EURPLN",
+    "GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPPLN",
     "XAGUSD","XAUUSD","XPDUSD","XPTUSD"
   ],
 
-  "intervals": ["15m", "30m", "60m"],
+  "symbols": [
+    "EURUSD","GBPUSD","USDCHF","USDJPY","USDCNH","USDRUB",
+    "AUDUSD","NZDUSD","USDCAD","USDSEK","USDPLN",
+    "AUDCAD","AUDCHF","AUDJPY","AUDNZD","AUDPLN",
+    "CADCHF","CADJPY","CADPLN",
+    "CHFJPY","CHFPLN","CNHJPY",
+    "EURAUD","EURCAD","EURCHF","EURCNH","EURGBP","EURJPY",
+    "EURNZD","EURPLN",
+    "GBPAUD","GBPCAD","GBPCHF","GBPJPY","GBPPLN",
+    "XAGUSD","XAUUSD","XPDUSD","XPTUSD"
+  ],
+
+  "timeframes": ["M15", "M30", "H1"],
 
   "rsi": {
     "period": 14,
     "buy": 30,
     "sell": 70
   },
+  "rsi_buy": 30,
+  "rsi_sell": 70,
 
   "trailing": {
     "trigger_pips": 10,
@@ -23,16 +41,22 @@
   },
 
   "news": {
-    "sources": ["Investing", "ForexFactory", "MarketWatch"]
+    "sources": ["Investing", "ForexFactory", "MarketWatch"],
+    "per_source": 15
   },
 
   "mt5": {
+    "auto_login": false,
     "login": 0,
     "password": "",
-    "server": ""
+    "server": "",
+    "default_lot": 0.10
   },
 
   "ui": {
+    "auto_refresh_minutes": 30
+  }
+}
     "auto_refresh_minutes": 30
   }
 }
