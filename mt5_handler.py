@@ -1,416 +1,409 @@
 # mt5_handler.py
-# -*- coding: utf-8 -*-
-
-"""
-Warstwa integracji z MetaTrader 5 z bezpiecznym fallbackiem:
-- Gdy MetaTrader5 jest dostępny (lokalnie) -> realne zlecenia.
-- Gdy niedostępny (np. Streamlit Cloud)      -> brak twardych błędów, czytelne komunikaty.
-
-Wymagania (lokalnie):
-  pip install MetaTrader5
-
-Uwaga: Pakiet MetaTrader5 nie ma kół dla większości środowisk linuksowych/chmurowych.
-"""
+# Hybrydowa obsługa MT5: realna (gdy biblioteka MetaTrader5 jest dostępna)
+# oraz tryb MOCK (gdy pracujemy w chmurze / bez MT5).
+#
+# Użycie:
+#   from mt5_handler import MT5
+#   mt5 = MT5()
+#   mt5.connect(login=..., password=..., server=...)
+#   mt5.place_order(symbol="EURUSD", action="BUY", volume=0.1)
+#   mt5.set_trailing(symbol="EURUSD", profit_trigger_pips=10, trail_step_pips=10)
+#   mt5.close_position(ticket=123456)
+#   mt5.shutdown()
 
 from __future__ import annotations
 
+import os
 import time
-import threading
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
-# --- próba importu MT5 --------------------------------------------------------
+
+# ------------------------------------------------------------
+# Czy MetaTrader5 jest dostępny?
+# ------------------------------------------------------------
+MT5_AVAILABLE = False
 try:
-    import MetaTrader5 as MT5  # type: ignore
-    _MT5_AVAILABLE = True
+    # Pozwalamy wymusić MOCK przez zmienną środowiskową
+    if os.environ.get("USE_MT5", "1") == "1":
+        import MetaTrader5 as _mt5  # type: ignore
+        MT5_AVAILABLE = True
 except Exception:
-    # Pakiet niedostępny (np. Streamlit Cloud)
-    MT5 = None  # type: ignore
-    _MT5_AVAILABLE = False
+    MT5_AVAILABLE = False
 
-
-# ====== Pomocnicze struktury danych ==========================================
-
-@dataclass
-class ConnectResult:
-    available: bool
-    connected: bool
-    message: str
 
 @dataclass
 class OrderResult:
-    success: bool
-    ticket: Optional[int]
-    message: str
-    request: Optional[Dict[str, Any]] = None
-    result_raw: Optional[Dict[str, Any]] = None
+    ok: bool
+    ticket: Optional[int] = None
+    comment: str = ""
+
 
 @dataclass
-class PositionInfo:
+class Position:
     ticket: int
     symbol: str
+    type: str  # "BUY" albo "SELL"
     volume: float
-    type: int       # 0=BUY, 1=SELL
     price_open: float
-    sl: float
-    tp: float
-    comment: str
+    sl: Optional[float]
+    tp: Optional[float]
+    profit: float
 
 
-# ====== Klasa integracji ======================================================
-
-class MT5Handler:
+# ------------------------------------------------------------
+# Implementacja MOCK (dla chmury / bez MT5)
+# ------------------------------------------------------------
+class _MockMT5:
     """
-    Prosta otoczka na MetaTrader5 z:
-    - connect/login
-    - market order
-    - modyfikacja SL/TP
-    - zamknięcie pozycji
-    - trailing SL/TP (manualny)
-    - tryb DRY-RUN (symulacja bez wysyłania do brokera)
+    Bardzo prosty mock. Trzyma pozycje w pamięci procesu.
+    Nie łączy się z żadnym brokerem. Przydaje się na Streamlit Cloud,
+    gdzie nie możemy zainstalować MetaTrader5.
     """
 
-    def __init__(self, dry_run: bool = False, tz: str = "Europe/Warsaw"):
-        self.available = _MT5_AVAILABLE
+    def __init__(self) -> None:
         self.connected = False
-        self.login_id: Optional[int] = None
-        self.server: Optional[str] = None
-        self.tz = tz
-        self._trailing_threads: Dict[int, threading.Thread] = {}
-        self._trailing_flags: Dict[int, Dict[str, Any]] = {}
-        self.dry_run = dry_run
+        self._positions: Dict[int, Position] = {}
+        self._next_ticket = 1
+        self._balance = 100000.0
 
-    # ------------------------------------------------------------------ utils
+    # -- API zbliżone do prawdziwego handlera --
 
-    def is_available(self) -> bool:
-        """Czy pakiet MetaTrader5 jest dostępny w tym środowisku."""
-        return self.available
-
-    # ---------------------------------------------------------------- connect
-
-    def connect(self) -> ConnectResult:
-        if not self.available:
-            return ConnectResult(False, False, "MetaTrader5 package not available in this environment.")
-
-        if self.connected:
-            return ConnectResult(True, True, "Already connected.")
-
-        ok = MT5.initialize()  # type: ignore
-        if not ok:
-            return ConnectResult(True, False, f"MT5.initialize() failed: {MT5.last_error()}")
+    def connect(self, login: Optional[int] = None, password: Optional[str] = None, server: Optional[str] = None) -> bool:
         self.connected = True
-        return ConnectResult(True, True, "MT5 initialized.")
+        print("[MOCK MT5] Connected (symulacja).")
+        return True
 
-    def login(self, login: int, password: str, server: str) -> ConnectResult:
-        if not self.available:
-            return ConnectResult(False, False, "MetaTrader5 not available here.")
+    def is_connected(self) -> bool:
+        return self.connected
 
-        if not self.connected:
-            c = self.connect()
-            if not c.connected:
-                return c
+    def shutdown(self) -> None:
+        self.connected = False
+        print("[MOCK MT5] Shutdown (symulacja).")
 
-        ok = MT5.login(login, password=password, server=server)  # type: ignore
-        if not ok:
-            return ConnectResult(True, False, f"MT5.login failed: {MT5.last_error()}")
-        self.login_id = login
-        self.server = server
-        return ConnectResult(True, True, "Logged in to MT5.")
+    def get_balance(self) -> float:
+        return self._balance
 
-    # ------------------------------------------------------------- symbol info
+    def get_positions(self, symbol: Optional[str] = None) -> List[Position]:
+        positions = list(self._positions.values())
+        if symbol:
+            positions = [p for p in positions if p.symbol == symbol]
+        return positions
 
-    def _ensure_symbol(self, symbol: str) -> Tuple[bool, str]:
-        """Upewnia się, że symbol jest dostępny (subskrypcja)."""
-        if self.dry_run or not self.available:
-            return True, "DRY-RUN or not available -> skip symbol check."
-        info = MT5.symbol_info(symbol)  # type: ignore
-        if info is None:
-            return False, f"Symbol {symbol} not found."
-        if not info.visible:
-            if not MT5.symbol_select(symbol, True):  # type: ignore
-                return False, f"Failed to select symbol {symbol}."
-        return True, "OK"
-
-    # --------------------------------------------------------------- market order
-
-    def place_market_order(
+    def place_order(
         self,
         symbol: str,
+        action: str,
         volume: float,
-        side: str,  # "BUY" | "SELL"
         sl: Optional[float] = None,
         tp: Optional[float] = None,
-        comment: str = "SEP Order",
-        deviation: int = 10,
+        deviation: int = 20,
+        comment: str = "streamlit-order",
     ) -> OrderResult:
-        """
-        Market order. Zwraca OrderResult z ticketem (o ile sukces).
-        """
-        if not self.available:
-            return OrderResult(False, None, "MT5 not available in this environment.")
+        if not self.connected:
+            return OrderResult(False, None, "Not connected (MOCK)")
+        ticket = self._next_ticket
+        self._next_ticket += 1
+        price = 1.0  # symulowana cena
+        pos = Position(
+            ticket=ticket,
+            symbol=symbol,
+            type=action.upper(),
+            volume=volume,
+            price_open=price,
+            sl=sl,
+            tp=tp,
+            profit=0.0,
+        )
+        self._positions[ticket] = pos
+        print(f"[MOCK MT5] Placed {action} {symbol} {volume} lots, ticket={ticket}")
+        return OrderResult(True, ticket, "OK (MOCK)")
 
-        ok, msg = self._ensure_symbol(symbol)
-        if not ok:
-            return OrderResult(False, None, msg)
+    def close_position(self, ticket: int) -> bool:
+        if ticket in self._positions:
+            del self._positions[ticket]
+            print(f"[MOCK MT5] Closed position ticket={ticket}")
+            return True
+        print(f"[MOCK MT5] No position with ticket={ticket}")
+        return False
 
-        if self.dry_run:
-            # Symulacja: „udawany” ticket
-            fake_ticket = int(time.time())
-            req = {
-                "symbol": symbol, "volume": volume, "type": side,
-                "sl": sl, "tp": tp, "comment": comment, "deviation": deviation
-            }
-            return OrderResult(True, fake_ticket, "DRY-RUN: placed", req, {"retcode": 0})
+    def set_trailing(self, symbol: str, profit_trigger_pips: int, trail_step_pips: int) -> None:
+        # W mocku tylko wypisujemy w logu.
+        print(
+            f"[MOCK MT5] Trailing set for {symbol}: trigger={profit_trigger_pips} pips, step={trail_step_pips} pips"
+        )
 
-        # Realny request
-        order_type = MT5.ORDER_TYPE_BUY if side.upper() == "BUY" else MT5.ORDER_TYPE_SELL  # type: ignore
-        price = MT5.symbol_info_tick(symbol).ask if side.upper() == "BUY" else MT5.symbol_info_tick(symbol).bid  # type: ignore
+
+# ------------------------------------------------------------
+# Prawdziwa implementacja na MetaTrader5 (do użycia lokalnie)
+# ------------------------------------------------------------
+class _RealMT5:
+    def __init__(self) -> None:
+        self.connected = False
+
+    def connect(self, login: Optional[int] = None, password: Optional[str] = None, server: Optional[str] = None) -> bool:
+        # start terminala (jeśli potrzeba – często wystarczy sama inicjalizacja)
+        if not _mt5.initialize():
+            print(f"[MT5] initialize() failed, error: {_mt5.last_error()}")
+            return False
+
+        if all(v is not None for v in (login, password, server)):
+            authorized = _mt5.login(login, password=password, server=server)
+            if not authorized:
+                print(f"[MT5] login failed, error: {_mt5.last_error()}")
+                return False
+
+        self.connected = True
+        print("[MT5] Connected.")
+        return True
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def shutdown(self) -> None:
+        try:
+            _mt5.shutdown()
+        finally:
+            self.connected = False
+        print("[MT5] Shutdown.")
+
+    def get_balance(self) -> float:
+        account_info = _mt5.account_info()
+        if account_info is None:
+            return 0.0
+        return float(account_info.balance)
+
+    def get_positions(self, symbol: Optional[str] = None) -> List[Position]:
+        if symbol:
+            mt5_positions = _mt5.positions_get(symbol=symbol)
+        else:
+            mt5_positions = _mt5.positions_get()
+        result: List[Position] = []
+        if mt5_positions is None:
+            return result
+
+        for p in mt5_positions:
+            result.append(
+                Position(
+                    ticket=p.ticket,
+                    symbol=p.symbol,
+                    type="BUY" if p.type == 0 else "SELL",
+                    volume=float(p.volume),
+                    price_open=float(p.price_open),
+                    sl=float(p.sl) if p.sl != 0 else None,
+                    tp=float(p.tp) if p.tp != 0 else None,
+                    profit=float(p.profit),
+                )
+            )
+        return result
+
+    def _symbol_check(self, symbol: str) -> bool:
+        if not _mt5.symbol_select(symbol, True):
+            print(f"[MT5] symbol_select({symbol}) failed, error: {_mt5.last_error()}")
+            return False
+        return True
+
+    def place_order(
+        self,
+        symbol: str,
+        action: str,
+        volume: float,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+        deviation: int = 20,
+        comment: str = "streamlit-order",
+    ) -> OrderResult:
+        if not self.connected:
+            return OrderResult(False, None, "Not connected")
+
+        if not self._symbol_check(symbol):
+            return OrderResult(False, None, f"Symbol {symbol} not available")
+
+        action = action.upper()
+        if action not in ("BUY", "SELL"):
+            return OrderResult(False, None, "action must be BUY or SELL")
+
+        # bieżący tick
+        tick = _mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return OrderResult(False, None, "No tick")
+
+        if action == "BUY":
+            price = tick.ask
+            order_type = _mt5.ORDER_TYPE_BUY
+        else:
+            price = tick.bid
+            order_type = _mt5.ORDER_TYPE_SELL
 
         request = {
-            "action": MT5.TRADE_ACTION_DEAL,  # type: ignore
+            "action": _mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
             "price": float(price),
-            "sl": float(sl) if sl else 0.0,
-            "tp": float(tp) if tp else 0.0,
             "deviation": int(deviation),
-            "magic": 778899,
+            "magic": 123456,
             "comment": comment,
-            "type_time": MT5.ORDER_TIME_GTC,  # type: ignore
-            "type_filling": MT5.ORDER_FILLING_FOK,  # type: ignore (zmień pod brokera jeśli potrzeba: IOC)
+            "type_time": _mt5.ORDER_TIME_GTC,
+            "type_filling": _mt5.ORDER_FILLING_FOK,
         }
+        if sl:
+            request["sl"] = float(sl)
+        if tp:
+            request["tp"] = float(tp)
 
-        result = MT5.order_send(request)  # type: ignore
+        result = _mt5.order_send(request)
         if result is None:
-            return OrderResult(False, None, f"order_send returned None: {MT5.last_error()}", request, None)  # type: ignore
+            return OrderResult(False, None, f"order_send failed: {_mt5.last_error()}")
 
-        if result.retcode != MT5.TRADE_RETCODE_DONE:  # type: ignore
-            return OrderResult(
-                False,
-                getattr(result, "order", None),
-                f"MT5 send failed: retcode={result.retcode}",
-                request,
-                result._asdict() if hasattr(result, "_asdict") else None,
-            )
+        if result.retcode != _mt5.TRADE_RETCODE_DONE:
+            return OrderResult(False, None, f"retcode={result.retcode} {result.comment}")
 
-        return OrderResult(
-            True,
-            getattr(result, "order", None),
-            "Order placed.",
-            request,
-            result._asdict() if hasattr(result, "_asdict") else None,
-        )
+        ticket = int(result.order) if result.order != 0 else int(getattr(result, "deal", 0))
+        print(f"[MT5] Placed {action} {symbol} {volume} lots, ticket={ticket}")
+        return OrderResult(True, ticket, "OK")
 
-    # --------------------------------------------------------------- modify SL/TP
+    def close_position(self, ticket: int) -> bool:
+        pos_list = _mt5.positions_get(ticket=ticket)
+        if pos_list is None or len(pos_list) == 0:
+            print(f"[MT5] close_position: no position for ticket={ticket}")
+            return False
 
-    def modify_sl_tp(self, symbol: str, ticket: int, sl: Optional[float], tp: Optional[float]) -> OrderResult:
-        if not self.available:
-            return OrderResult(False, None, "MT5 not available.")
-
-        if self.dry_run:
-            return OrderResult(True, ticket, "DRY-RUN: SL/TP modified.", {"sl": sl, "tp": tp}, None)
-
-        pos = self._find_position(ticket)
-        if pos is None:
-            return OrderResult(False, None, f"Position {ticket} not found.")
-
-        req = {
-            "action": MT5.TRADE_ACTION_SLTP,  # type: ignore
-            "position": ticket,
-            "symbol": symbol,
-            "sl": float(sl) if sl else 0.0,
-            "tp": float(tp) if tp else 0.0,
-            "magic": 778899,
-            "comment": "SEP modify SL/TP",
-        }
-        result = MT5.order_send(req)  # type: ignore
-        if result is None:
-            return OrderResult(False, None, f"order_send returned None: {MT5.last_error()}", req, None)  # type: ignore
-        if result.retcode != MT5.TRADE_RETCODE_DONE:  # type: ignore
-            return OrderResult(False, None, f"Modify SL/TP failed: {result.retcode}", req, result._asdict())
-        return OrderResult(True, ticket, "SL/TP modified.", req, result._asdict())
-
-    # ---------------------------------------------------------------- close
-
-    def close_position(self, ticket: int) -> OrderResult:
-        if not self.available:
-            return OrderResult(False, None, "MT5 not available.")
-
-        if self.dry_run:
-            return OrderResult(True, ticket, "DRY-RUN: position closed.", {"ticket": ticket}, None)
-
-        pos = self._find_position(ticket)
-        if pos is None:
-            return OrderResult(False, None, f"Position {ticket} not found.")
-
-        # Zamykanie: transakcja odwrotna
+        pos = pos_list[0]
         symbol = pos.symbol
-        vol = pos.volume
-        order_type = MT5.ORDER_TYPE_SELL if pos.type == MT5.ORDER_TYPE_BUY else MT5.ORDER_TYPE_BUY  # type: ignore
-        price = MT5.symbol_info_tick(symbol).bid if order_type == MT5.ORDER_TYPE_SELL else MT5.symbol_info_tick(symbol).ask  # type: ignore
+        volume = pos.volume
 
-        req = {
-            "action": MT5.TRADE_ACTION_DEAL,  # type: ignore
-            "position": ticket,
+        # cena zamknięcia zależnie od kierunku
+        tick = _mt5.symbol_info_tick(symbol)
+        if tick is None:
+            print("[MT5] No tick on close.")
+            return False
+
+        if pos.type == _mt5.POSITION_TYPE_BUY:
+            price = tick.bid  # zamykamy po przeciwnej stronie
+            order_type = _mt5.ORDER_TYPE_SELL
+        else:
+            price = tick.ask
+            order_type = _mt5.ORDER_TYPE_BUY
+
+        request = {
+            "action": _mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": float(vol),
+            "volume": float(volume),
             "type": order_type,
+            "position": int(ticket),
             "price": float(price),
-            "deviation": 10,
-            "magic": 778899,
-            "comment": "SEP close",
-            "type_time": MT5.ORDER_TIME_GTC,  # type: ignore
-            "type_filling": MT5.ORDER_FILLING_FOK,  # type: ignore
+            "deviation": 30,
+            "magic": 123456,
+            "comment": "close-by-handler",
+            "type_time": _mt5.ORDER_TIME_GTC,
+            "type_filling": _mt5.ORDER_FILLING_FOK,
         }
-        result = MT5.order_send(req)  # type: ignore
-        if result is None:
-            return OrderResult(False, None, f"order_send returned None: {MT5.last_error()}", req, None)  # type: ignore
-        if result.retcode != MT5.TRADE_RETCODE_DONE:  # type: ignore
-            return OrderResult(False, None, f"Close failed: {result.retcode}", req, result._asdict())
-        return OrderResult(True, ticket, "Position closed.", req, result._asdict())
+        result = _mt5.order_send(request)
+        ok = result and result.retcode == _mt5.TRADE_RETCODE_DONE
+        print(f"[MT5] close_position ticket={ticket} -> {'OK' if ok else result.retcode}")
+        return bool(ok)
 
-    # ----------------------------------------------------------- helper: find pos
-
-    def _find_position(self, ticket: int) -> Optional[PositionInfo]:
-        if not self.available:
-            return None
-        positions = MT5.positions_get()  # type: ignore
-        if positions is None:
-            return None
-        for p in positions:
-            if int(p.ticket) == int(ticket):
-                return PositionInfo(
-                    ticket=int(p.ticket),
-                    symbol=p.symbol,
-                    volume=float(p.volume),
-                    type=int(p.type),
-                    price_open=float(p.price_open),
-                    sl=float(p.sl),
-                    tp=float(p.tp),
-                    comment=str(p.comment),
-                )
-        return None
-
-    # ====================================================== TRAILING (manualny)
-
-    def start_trailing(
-        self,
-        ticket: int,
-        symbol: str,
-        side: str,               # "BUY" | "SELL"
-        step_pips: float = 10.0, # co ile pipsów przesuwać
-        arm_after_pips: float = 10.0,  # dopiero po osiągnięciu zysku X pipsów
-        pip_size: float = 0.0001,      # EURUSD 0.0001, USDJPY 0.01, złoto 0.1/0.01 itd.
-        max_tp: Optional[float] = None,
-        update_secs: float = 2.0,
-    ) -> str:
+    def set_trailing(self, symbol: str, profit_trigger_pips: int, trail_step_pips: int) -> None:
         """
-        Uruchamia w tle wątek, który:
-         - gdy zysk > arm_after_pips, przesuwa SL co step_pips,
-         - opcjonalnie utrzymuje TP (jeśli max_tp podane),
-         - działa aż do stopu (stop_trailing) lub gdy pozycja zniknie.
+        Prosty trailing: jeśli pozycja ma zysk >= trigger, to podnosi SL o 'step' pipsów
+        od aktualnej ceny (dla BUY) lub ponad cenę (dla SELL). W praktyce trailing należy
+        wywoływać cyklicznie (np. co 10–30s) w osobnym wątku/cron.
         """
-        if not self.available and not self.dry_run:
-            return "MT5 not available. Cannot start trailing."
-
-        if ticket in self._trailing_threads:
-            return f"Trailing already running for ticket {ticket}."
-
-        self._trailing_flags[ticket] = {
-            "running": True,
-            "symbol": symbol,
-            "side": side.upper(),
-            "step": float(step_pips),
-            "arm": float(arm_after_pips),
-            "pip": float(pip_size),
-            "max_tp": max_tp,
-            "update": float(update_secs),
-        }
-
-        t = threading.Thread(target=self._trailing_worker, args=(ticket,), daemon=True)
-        self._trailing_threads[ticket] = t
-        t.start()
-        return "Trailing started."
-
-    def stop_trailing(self, ticket: int) -> str:
-        flag = self._trailing_flags.get(ticket)
-        if not flag:
-            return "No trailing found for this ticket."
-        flag["running"] = False
-        return "Trailing stop requested to stop."
-
-    def _trailing_worker(self, ticket: int) -> None:
-        flag = self._trailing_flags.get(ticket)
-        if not flag:
+        positions = self.get_positions(symbol=symbol)
+        if not positions:
             return
 
-        symbol = flag["symbol"]
-        side = flag["side"]
-        step = flag["step"]
-        arm = flag["arm"]
-        pip = flag["pip"]
-        max_tp = flag["max_tp"]
-        update = flag["update"]
+        info = _mt5.symbol_info(symbol)
+        if info is None or info.point == 0:
+            print(f"[MT5] No symbol info for {symbol}")
+            return
+        point = info.point
+        pips = lambda x: x * 10 * point if info.digits >= 3 else x * point
 
-        last_armed = False
-        last_reference_sl: Optional[float] = None
+        tick = _mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return
 
-        while flag["running"]:
-            # Pobierz pozycję / ceny
-            pos = self._find_position(ticket)
-            if pos is None:
-                # w DRY-RUN możemy tylko „udawać”
-                if self.dry_run:
-                    time.sleep(update)
-                    continue
-                # realnie – kończ
-                break
+        for p in positions:
+            if p.type == "BUY":
+                current_price = tick.bid
+                gained = (current_price - p.price_open) / pips(1)
+                if gained >= profit_trigger_pips:
+                    new_sl = current_price - pips(trail_step_pips)
+                    if p.sl is None or new_sl > p.sl:
+                        self._modify_sl(p.ticket, new_sl)
+            else:  # SELL
+                current_price = tick.ask
+                gained = (p.price_open - current_price) / pips(1)
+                if gained >= profit_trigger_pips:
+                    new_sl = current_price + pips(trail_step_pips)
+                    if p.sl is None or new_sl < p.sl:
+                        self._modify_sl(p.ticket, new_sl)
 
-            tick = None
-            if self.available and not self.dry_run:
-                tick = MT5.symbol_info_tick(symbol)  # type: ignore
+    def _modify_sl(self, ticket: int, new_sl: float) -> None:
+        pos_list = _mt5.positions_get(ticket=ticket)
+        if not pos_list:
+            return
+        pos = pos_list[0]
+        request = {
+            "action": _mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": pos.symbol,
+            "sl": float(new_sl),
+            "tp": pos.tp if pos.tp else 0.0,
+            "magic": 123456,
+            "comment": "trail-sl",
+        }
+        result = _mt5.order_send(request)
+        if result and result.retcode == _mt5.TRADE_RETCODE_DONE:
+            print(f"[MT5] SL modified ticket={ticket} -> {new_sl}")
+        else:
+            print(f"[MT5] SL modify failed ticket={ticket}: {getattr(result, 'retcode', 'none')}")
 
-            # Bieżąca cena i zysk w pipsach
-            if side == "BUY":
-                curr_price = (tick.bid if tick else pos.price_open + (step * pip))  # prosta symulacja dla DRY-RUN
-                profit_pips = (curr_price - pos.price_open) / pip
-            else:
-                curr_price = (tick.ask if tick else pos.price_open - (step * pip))
-                profit_pips = (pos.price_open - curr_price) / pip
 
-            # uzbrojenie trailing dopiero po arm_after_pips
-            if profit_pips >= arm:
-                last_armed = True
+# ------------------------------------------------------------
+# Publiczna klasa, która wybiera backend (Real vs Mock)
+# ------------------------------------------------------------
+class MT5:
+    def __init__(self) -> None:
+        if MT5_AVAILABLE:
+            self._backend: Any = _RealMT5()
+            self.mode = "REAL"
+        else:
+            self._backend = _MockMT5()
+            self.mode = "MOCK"
 
-            if last_armed:
-                # docelowy SL zgodnie z krokiem
-                if side == "BUY":
-                    target_sl = curr_price - (step * pip)
-                    if last_reference_sl is None or target_sl > last_reference_sl:
-                        # przesuń SL w górę
-                        self.modify_sl_tp(symbol, ticket, sl=target_sl, tp=max_tp)
-                        last_reference_sl = target_sl
-                else:
-                    target_sl = curr_price + (step * pip)
-                    if last_reference_sl is None or target_sl < last_reference_sl:
-                        self.modify_sl_tp(symbol, ticket, sl=target_sl, tp=max_tp)
-                        last_reference_sl = target_sl
+    # Proxy do metod backendu
+    def connect(self, *args, **kwargs) -> bool:
+        return self._backend.connect(*args, **kwargs)
 
-            time.sleep(update)
+    def is_connected(self) -> bool:
+        return self._backend.is_connected()
 
-        # sprzątanie
-        self._trailing_threads.pop(ticket, None)
-        self._trailing_flags.pop(ticket, None)
+    def shutdown(self) -> None:
+        return self._backend.shutdown()
 
-# ====== Fabryka (wygodny konstruktor) =========================================
+    def get_balance(self) -> float:
+        return self._backend.get_balance()
 
-def get_handler(dry_run: bool = False) -> MT5Handler:
-    """
-    Zwraca gotowy obiekt obsługujący zarówno tryb lokalny (MT5) jak i chmurowy (fallback).
-    Użycie:
-        mt5 = get_handler(dry_run=False)
-        if not mt5.is_available():
-            st.warning("MT5 niedostępne w tym środowisku – przyciski tradingowe ukryte")
-    """
-    return MT5Handler(dry_run=dry_run)
+    def get_positions(self, symbol: Optional[str] = None) -> List[Position]:
+        return self._backend.get_positions(symbol=symbol)
+
+    def place_order(
+        self,
+        symbol: str,
+        action: str,
+        volume: float,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+        deviation: int = 20,
+        comment: str = "streamlit-order",
+    ) -> OrderResult:
+        return self._backend.place_order(symbol, action, volume, sl, tp, deviation, comment)
+
+    def close_position(self, ticket: int) -> bool:
+        return self._backend.close_position(ticket)
+
+    def set_trailing(self, symbol: str, profit_trigger_pips: int, trail_step_pips: int) -> None:
+        return self._backend.set_trailing(symbol, profit_trigger_pips, trail_step_pips)
