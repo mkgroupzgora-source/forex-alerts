@@ -1,13 +1,12 @@
-# requirements-lokal.txt (Local: z MetaTrader5)
-streamlit==1.32.2
+streamlit==1.28.2         # ostatnie stabilne wspierające Py3.8
 yfinance==0.2.37
-pandas==2.2.2
-numpy==1.26.4
+pandas==2.0.3             # 2.1+ wymaga Py>=3.9
+numpy==1.24.4             # kompatybilne z pandas 2.0 i Py3.8
 vaderSentiment==3.3.2
 requests==2.31.0
 beautifulsoup4==4.12.3
 lxml==4.9.3
 feedparser==6.0.11
-ta-lib==0.4.28
+ta-lib==0.4.28            # wheel dla cp38 win_amd64 dostępny
 ta @ git+https://github.com/bukosabino/ta.git
-MetaTrader5==5.0.5050
+MetaTrader5==5.0.5050     # sprawdzona z Py3.8; w razie czego spróbuj 5.0.45 lub 5.0.5200
