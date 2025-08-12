@@ -1,0 +1,13 @@
+# requirements-lokal.txt (Local: z MetaTrader5)
+streamlit==1.32.2
+yfinance==0.2.37
+pandas==2.2.2
+numpy==1.26.4
+vaderSentiment==3.3.2
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==4.9.3
+feedparser==6.0.11
+ta-lib==0.4.28
+ta @ git+https://github.com/bukosabino/ta.git
+MetaTrader5==5.0.5050
