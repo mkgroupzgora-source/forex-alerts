@@ -1,8 +1,7 @@
-# requirements.txt (Cloud: bez MetaTrader5)
-streamlit==1.32.2
+streamlit==1.28.2
 yfinance==0.2.37
-pandas==2.2.2
-numpy==1.26.4
+pandas==2.0.3
+numpy==1.24.4
 vaderSentiment==3.3.2
 requests==2.31.0
 beautifulsoup4==4.12.3
