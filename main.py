@@ -1,46 +1,47 @@
-import time
-from strategy import check_rsi_signal
-from notifier import send_console_alert, send_email_alert
-import yfinance as yf
-import json
+from typing import Optional
+from fastapi import FastAPI, Query, HTTPException
 
-with open("config.json") as f:
-    config = json.load(f)
+app = FastAPI()
 
-PAIRS = config["pairs"]
-RSI_BUY = config["rsi_buy_threshold"]
-RSI_SELL = config["rsi_sell_threshold"]
-INTERVAL = config["interval_minutes"] * 60
-EMAIL = config["recipient_email"]
+# Przykładowe źródło danych (zastąp własnym)
+OFFERS = [
+    {"id": 1, "city": "Warszawa", "price": 520000, "rooms": 2},
+    {"id": 2, "city": "Gdańsk",   "price": 780000, "rooms": 3},
+    {"id": 3, "city": "Kraków",   "price": 410000, "rooms": 1},
+]
 
-def run():
-    while True:
-        for pair in PAIRS:
-            print(f"\n[INFO] Checking RSI signal for {pair}...")
+@app.get("/offers")
+def search_offers(
+    max_price: Optional[float] = Query(None, ge=0, description="Maksymalna cena"),
+    city: Optional[str] = Query(None, min_length=2, description="Miasto"),
+    min_rooms: Optional[int] = Query(0, ge=0, description="Minimalna liczba pokoi"),
+):
+    """
+    Zwraca oferty z opcjonalnym filtrowaniem.
+    Wszystkie parametry są opcjonalne i bezpiecznie normalizowane.
+    """
 
-            try:
-                df = yf.download(pair, period="7d", interval="1h", progress=False)
-            except Exception as e:
-                print(f"[ERROR] Failed to download data for {pair}: {e}")
-                continue
+    # --- Normalizacja / wartości domyślne ---
+    # jeśli max_price nie podane -> nieskończoność (brak górnego limitu)
+    max_price_val = float("inf") if max_price is None else float(max_price)
+    # jeśli min_rooms nie podane -> 0
+    min_rooms_val = 0 if min_rooms is None else int(min_rooms)
+    # jeśli city podane -> porównujemy case-insensitive
+    city_norm = city.lower() if city else None
 
-            if df is not None and not df.empty:
-                try:
-                    signal, rsi = check_rsi_signal(df, RSI_BUY, RSI_SELL)
+    # --- Walidacje dodatkowe (opcjonalnie) ---
+    if max_price_val < 0 or min_rooms_val < 0:
+        raise HTTPException(status_code=400, detail="Parametry nie mogą być ujemne.")
 
-                    if signal != "HOLD":
-                        msg = f"{pair} | RSI: {rsi:.2f} → SIGNAL: {signal}"
-                        send_console_alert(msg)
-                        send_email_alert(EMAIL, f"Forex Alert for {pair}", msg)
-                    else:
-                        print(f"[INFO] {pair} RSI: {rsi:.2f} – No signal.")
-                except Exception as e:
-                    print(f"[ERROR] Failed to process data for {pair}: {e}")
-            else:
-                print(f"[ERROR] No data returned for {pair}, skipping.")
+    # --- Filtrowanie bez None w działaniach matematycznych ---
+    results = []
+    for o in OFFERS:
+        if o["price"] > max_price_val:
+            continue
+        if o["rooms"] < min_rooms_val:
+            continue
+        if city_norm and o["city"].lower() != city_norm:
+            continue
+        results.append(o)
 
-        print(f"[INFO] Waiting {INTERVAL / 60} minutes...\n")
-        time.sleep(INTERVAL)
-
-if __name__ == "__main__":
-    run()
+    return {"count": len(results), "items": results}
