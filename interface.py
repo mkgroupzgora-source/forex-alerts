@@ -1,233 +1,340 @@
 # interface.py
-# Streamlit UI: sygnały RSI + formacje świecowe (M15, M30, H1)
-# Bez TA‑Lib, działa w chmurze (używa "ta" + własne reguły formacji)
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
-import yfinance as yf
 import streamlit as st
+import yfinance as yf
 
-from ta.momentum import RSIIndicator
-from candle_patterns import last_pattern, scan_patterns
+# --- NEWS / NLP ---
+try:
+    # Twój moduł z poprzedniej sekcji
+    from news_parsers import fetch_all_news
+except Exception:
+    fetch_all_news = None
 
-# ========= USTAWIENIA =========
-PAIRS: List[str] = [
-    "EURUSD=X", "GBPUSD=X", "USDCHF=X", "USDJPY=X",
-    "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDPLN=X",
-    # metale/crypto na Yahoo: XAUUSD i XAGUSD bywają pod innymi tickerami.
-    # Popularne zamienniki:
-    # Złoto (spot): "GC=F" lub "XAUUSD=X" (czasem brak). My spróbujemy oba.
-    # Srebro (spot): "SI=F" lub "XAGUSD=X"
-]
-# zamienniki tickera jeśli podstawowy nie działa
-TICKER_ALIASES: Dict[str, List[str]] = {
-    "XAUUSD=X": ["XAUUSD=X", "GC=F"],
-    "XAGUSD=X": ["XAGUSD=X", "SI=F"],
+# Sentiment: użyj modułu jeśli istnieje, w przeciwnym wypadku fallback VADER
+try:
+    from sentiment_analysis import score_sentiment  # funkcja powinna zwracać [-1..1]
+except Exception:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _vader = SentimentIntensityAnalyzer()
+
+    def score_sentiment(text: str) -> float:
+        if not text:
+            return 0.0
+        s = _vader.polarity_scores(text or "")
+        return float(s.get("compound", 0.0))
+
+# ------------------ KONFIG ------------------
+
+# domyślne progi i interwały – mogą zostać nadpisane przez config.json
+DEFAULT_CONFIG = {
+    "pairs": [
+        # lista z Twojego zakresu – możesz skrócić dla testów
+        "EURUSD", "GBPUSD", "USDCHF", "USDJPY", "USDCNH", "USDRUB",
+        "AUDUSD", "NZDUSD", "USDCAD", "USDSEK", "USDPLN",
+        "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "AUDPLN",
+        "CADCHF", "CADJPY", "CADPLN",
+        "CHFJPY", "CHFPLN", "CNHJPY",
+        "EURAUD", "EURCAD", "EURCHF", "EURCNH", "EURGBP",
+        "EURJPY", "EURNZD", "EURPLN",
+        "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPPLN",
+        "XAGUSD", "XAUUSD", "XPDUSD", "XPTUSD",
+        # opcjonalnie ropa / krypto:
+        # "WTIUSD", "BRENTUSD", "BTCUSD"
+    ],
+    "rsi_buy_threshold": 30,
+    "rsi_sell_threshold": 70,
+    "rsi_period": 14,
+    "intervals": ["15m", "30m", "60m"],
+    "timezone": "Europe/Warsaw"
 }
 
-INTERVALS: Dict[str, Tuple[str, str]] = {
-    # nazwa → (yfinance interval, okres)
-    "M15": ("15m", "7d"),
-    "M30": ("30m", "7d"),
-    "H1":  ("60m", "30d"),
-}
+def load_config() -> Dict:
+    try:
+        with open("config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # dopełnij brakujące klucze
+        for k, v in DEFAULT_CONFIG.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except Exception:
+        return DEFAULT_CONFIG.copy()
 
-DEFAULT_RSI_BUY = 30
-DEFAULT_RSI_SELL = 70
+CFG = load_config()
+PAIRS: List[str] = CFG["pairs"]
+RSI_BUY = int(CFG["rsi_buy_threshold"])
+RSI_SELL = int(CFG["rsi_sell_threshold"])
+RSI_PERIOD = int(CFG["rsi_period"])
+INTERVALS = list(CFG["intervals"])
 
-BULLISH_NAMES = {
-    "Hammer",
-    "Bullish Engulfing",
-    "Piercing",
-    "Morning Star",
-}
-BEARISH_NAMES = {
-    "Shooting Star",
-    "Bearish Engulfing",
-    "Dark Cloud Cover",
-    "Evening Star",
-}
+# ------------------ NARZĘDZIA RYNKOWE ------------------
 
-
-# ========= FUNKCJE POMOCNICZE =========
-
-@st.cache_data(show_spinner=False, ttl=60*10)  # cache 10 min
-def fetch_ohlc(symbol: str, yf_interval: str, yf_period: str) -> pd.DataFrame:
-    """Pobiera OHLC dla symbolu; próbuje aliasów, czyści duplikaty."""
-    candidates = TICKER_ALIASES.get(symbol, [symbol])
-    last_err = None
-    for tick in candidates:
-        try:
-            df = yf.download(
-                tick, interval=yf_interval, period=yf_period, auto_adjust=True, progress=False
-            )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df = df[["Open", "High", "Low", "Close"]].copy()
-                df = df[~df.index.duplicated(keep="last")]
-                df.dropna(inplace=True)
-                return df
-        except Exception as e:
-            last_err = e
-            continue
-    # pusta ramka jako bezpieczny fallback
-    return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
-
-
-def compute_rsi(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series([], dtype="float64")
-    rsi = RSIIndicator(close=df["Close"], window=window).rsi()
-    return rsi
-
-
-def evaluate_signal(rsi_val: float, pattern: str, rsi_buy: int, rsi_sell: int) -> str:
+# mapowanie par do tickerów Yahoo Finance
+def to_yf_symbol(pair: str) -> Optional[str]:
     """
-    BUY: jeśli jest formacja bycza i RSI < rsi_buy
-    SELL: jeśli jest formacja niedźwiedzia i RSI > rsi_sell
-    NO SIGNAL w pozostałych przypadkach lub brak danych.
+    EURUSD -> 'EURUSD=X', XAUUSD -> 'XAUUSD=X', itp.
+    Wiele krzyżówek zadziała, ale nie wszystkie mają dane intraday.
     """
-    if pattern:
-        # jeśli w nazwie jest kilka, rozdziel po przecinku
-        labels = {p.strip() for p in pattern.split(",") if p.strip()}
-        if rsi_val is not None and pd.notna(rsi_val):
-            if labels & BULLISH_NAMES and rsi_val < rsi_buy:
-                return "BUY"
-            if labels & BEARISH_NAMES and rsi_val > rsi_sell:
-                return "SELL"
-    return "NO SIGNAL"
+    base = pair.upper()
+    # najczęściej wspierane przez Yahoo:
+    return f"{base}=X"
 
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """RSI (Wilder) bez ta-lib (EMA na wzrostach/spadkach)."""
+    delta = close.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    up_ema = pd.Series(up, index=close.index).ewm(alpha=1/period, adjust=False).mean()
+    down_ema = pd.Series(down, index=close.index).ewm(alpha=1/period, adjust=False).mean()
+    rs = up_ema / down_ema.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
 
-def analyze_pair_for_interval(symbol: str, interval_name: str, rsi_buy: int, rsi_sell: int) -> dict:
-    yf_interval, yf_period = INTERVALS[interval_name]
-    df = fetch_ohlc(symbol, yf_interval, yf_period)
+# proste formacje świecowe na ostatniej świecy
+def detect_candle_pattern(df: pd.DataFrame) -> Tuple[str, Optional[str]]:
+    """
+    Zwraca ('HAMMER' / 'SHOOTING_STAR' / 'ENGULF_BULL' / 'ENGULF_BEAR' / 'NONE', sygnał BUY/SELL/None)
+    Wystarczy do sygnałów filtrujących RSI.
+    """
+    if df is None or df.empty or len(df) < 3:
+        return "NONE", None
 
-    if df.empty:
-        return {
-            "pair": symbol,
-            "interval": interval_name,
-            "rsi": None,
-            "pattern": "",
-            "signal": "NO DATA",
-            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        }
+    o = df["Open"].iloc[-1]
+    h = df["High"].iloc[-1]
+    l = df["Low"].iloc[-1]
+    c = df["Close"].iloc[-1]
 
-    # RSI
-    df["RSI"] = compute_rsi(df)
-    rsi_val = float(df["RSI"].dropna().iloc[-1]) if not df["RSI"].dropna().empty else None
+    body = abs(c - o)
+    full = max(h, o, c) - min(l, o, c)
+    upper_shadow = h - max(o, c)
+    lower_shadow = min(o, c) - l
 
-    # Formacje (ostatnia świeca)
-    patt = last_pattern(df) or ""
+    # młotek: długi dolny cień, mały korpus, górny cień krótki
+    if lower_shadow > 2 * body and upper_shadow <= body and body / full < 0.35:
+        return "HAMMER", "BUY"
 
-    # Sygnał wg warunku „formacja + rsi”
-    sig = evaluate_signal(rsi_val, patt, rsi_buy, rsi_sell)
+    # spadająca gwiazda: długi górny cień, mały korpus, dolny krótki
+    if upper_shadow > 2 * body and lower_shadow <= body and body / full < 0.35:
+        return "SHOOTING_STAR", "SELL"
 
-    # znacznik czasu wg indeksu
-    last_ts = df.index[-1]
-    if hasattr(last_ts, "tz_localize") or getattr(last_ts, "tzinfo", None) is not None:
-        ts_str = last_ts.strftime("%Y-%m-%d %H:%M %Z")
-    else:
-        ts_str = last_ts.strftime("%Y-%m-%d %H:%M")
+    # objęcie – porównujemy dwie ostatnie świece
+    prev_o = df["Open"].iloc[-2]
+    prev_c = df["Close"].iloc[-2]
+    # Bullish Engulfing
+    if (prev_c < prev_o) and (c > o) and (c >= prev_o) and (o <= prev_c):
+        return "ENGULF_BULL", "BUY"
+    # Bearish Engulfing
+    if (prev_c > prev_o) and (c < o) and (c <= prev_o) and (o >= prev_c):
+        return "ENGULF_BEAR", "SELL"
 
-    return {
-        "pair": symbol,
-        "interval": interval_name,
-        "rsi": round(rsi_val, 2) if rsi_val is not None else None,
-        "pattern": patt,
-        "signal": sig,
-        "updated": ts_str,
-    }
+    return "NONE", None
 
+def fetch_ohlc(pair: str, yf_interval: str, period: str = "7d") -> Optional[pd.DataFrame]:
+    """
+    Pobiera OHLC dla pary w danym interwale z Yahoo.
+    Interwały 15m/30m/60m wymagają krótkiego period (np. 7d).
+    """
+    ticker = to_yf_symbol(pair)
+    if not ticker:
+        return None
+    try:
+        df = yf.download(ticker, period=period, interval=yf_interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns=str.title)  # O/H/L/C/Adj Close/Volume -> tytułowane
+        # niektóre tickery nie zwracają Open/High/Low – spróbuj wyliczyć z Close gdy brak
+        for col in ("Open", "High", "Low", "Close"):
+            if col not in df.columns:
+                df[col] = df["Adj Close"]
+        df = df[["Open", "High", "Low", "Close"]].dropna()
+        return df
+    except Exception:
+        return None
 
-def build_table(pairs: List[str], intervals: List[str], rsi_buy: int, rsi_sell: int) -> pd.DataFrame:
-    rows = []
-    for p in pairs:
-        for itv in intervals:
-            rows.append(analyze_pair_for_interval(p, itv, rsi_buy, rsi_sell))
-    df = pd.DataFrame(rows)
-    # sort: sygnały na górę, potem para i interwał
-    sig_order = {"BUY": 0, "SELL": 1, "NO SIGNAL": 2, "NO DATA": 3}
-    df["__order"] = df["signal"].map(sig_order).fillna(9)
-    df.sort_values(["__order", "pair", "interval"], inplace=True)
-    df.drop(columns="__order", inplace=True)
-    return df
+def signal_from_rsi_and_pattern(rsi_value: float,
+                                pattern_signal: Optional[str],
+                                rsi_buy: int,
+                                rsi_sell: int) -> Optional[str]:
+    """
+    Zwraca końcowy sygnał tylko gdy spełniony WARUNEK:
+    - jest formacja oraz RSI < rsi_buy (dla BUY) lub RSI > rsi_sell (dla SELL).
+    """
+    if pattern_signal == "BUY" and rsi_value is not None and rsi_value <= rsi_buy:
+        return "KUP"
+    if pattern_signal == "SELL" and rsi_value is not None and rsi_value >= rsi_sell:
+        return "SPRZEDAJ"
+    return None
 
+# ------------------ UI ------------------
 
-# ========= UI =========
+st.set_page_config(page_title="SEP Forex Signals", page_icon="📈", layout="wide")
 
-st.set_page_config(page_title="Forex Alerts – Patterns + RSI", layout="wide")
-
-st.title("📈 Forex Alerts – Formacje świecowe + RSI")
-st.caption("Sygnał pojawia się **tylko** jeśli jest rozpoznana formacja i RSI spełnia próg.")
-
+# Sidebar – ustawienia
 with st.sidebar:
-    st.subheader("Ustawienia")
-    rsi_buy = st.number_input("Próg RSI (BUY, poniżej):", min_value=5, max_value=50, value=DEFAULT_RSI_BUY, step=1)
-    rsi_sell = st.number_input("Próg RSI (SELL, powyżej):", min_value=50, max_value=95, value=DEFAULT_RSI_SELL, step=1)
+    st.header("⚙️ Ustawienia strategii")
+    RSI_BUY = st.number_input("Próg RSI dla KUP (≤)", min_value=5, max_value=50, value=RSI_BUY, step=1)
+    RSI_SELL = st.number_input("Próg RSI dla SPRZEDAJ (≥)", min_value=50, max_value=95, value=RSI_SELL, step=1)
+    RSI_PERIOD = st.number_input("Okres RSI", min_value=5, max_value=50, value=RSI_PERIOD, step=1)
+    INTERVALS = st.multiselect("Interwały", ["15m", "30m", "60m"], default=INTERVALS)
+    show_only_signals = st.checkbox("Pokaż tylko wiersze z aktywnym sygnałem", value=True)
 
-    chosen_pairs = st.multiselect("Pary:", options=PAIRS, default=PAIRS)
-    chosen_itv = st.multiselect("Interwały:", options=list(INTERVALS.keys()), default=["M15", "M30", "H1"])
+st.title("📊 SEP Forex Signals")
+st.caption("Analiza RSI + formacje świecowe + przypisane newsy. (Intra: M15/M30/H1, Yahoo Finance)")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        refresh = st.button("🔄 Odśwież teraz", use_container_width=True)
-    with col_b:
-        st.write("")  # odstęp
-        st.caption("Dane cache’owane 10 min. Odśwież wymusza pobranie.")
+colL, colR = st.columns([1, 3])
+with colL:
+    if st.button("🔁 Odśwież dane", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+with colR:
+    st.write(f"Ostatnia aktualizacja: **{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}**")
 
-# Wymuszenie mini‑busta cache przy odświeżeniu
-if refresh:
-    # param zależny od czasu do „przełamania” cache_data
-    st.session_state["__refresh_key"] = time.time()
+# ----------- Tabela sygnałów -----------
 
-st.markdown("### 🧭 Przegląd sygnałów")
-table = build_table(chosen_pairs, chosen_itv, rsi_buy, rsi_sell)
-st.dataframe(
-    table.rename(columns={
-        "pair": "Para",
-        "interval": "Interwał",
-        "rsi": "RSI",
-        "pattern": "Formacja",
-        "signal": "Sygnał",
-        "updated": "Aktualizacja"
-    }),
-    use_container_width=True,
-    hide_index=True
-)
+@st.cache_data(ttl=60)
+def build_signals(pairs: List[str], intervals: List[str]) -> pd.DataFrame:
+    rows = []
+    for pair in pairs:
+        for itv in intervals:
+            # Yahoo interwał = itv, period: 7d dla intraday
+            df = fetch_ohlc(pair, yf_interval=itv, period="7d")
+            if df is None or df.empty:
+                rows.append({
+                    "Para": pair, "Interwał": itv, "RSI": None,
+                    "Formacja": "BRAK DANYCH", "Sygnał": None, "Godzina": None
+                })
+                continue
 
-# Detal po kliknięciu – proste rozwijane szczegóły
-st.markdown("---")
-st.markdown("### 🔍 Szczegóły pary")
-col1, col2 = st.columns([1, 2])
-with col1:
-    symbol_pick = st.selectbox("Wybierz parę:", options=chosen_pairs)
-    itv_pick = st.selectbox("Interwał:", options=chosen_itv)
+            rsi = compute_rsi(df["Close"], period=RSI_PERIOD).iloc[-1]
+            pattern, patt_sig = detect_candle_pattern(df)
+            signal = signal_from_rsi_and_pattern(float(rsi), patt_sig, RSI_BUY, RSI_SELL)
 
-with col2:
-    yf_interval, yf_period = INTERVALS[itv_pick]
-    df_det = fetch_ohlc(symbol_pick, yf_interval, yf_period)
-    if df_det.empty:
-        st.warning("Brak danych dla wybranego instrumentu/interwału.")
+            # czas ostatniej świecy – w UTC -> lokalny string
+            ts = df.index[-1]
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize("UTC")
+            ts_str = ts.tz_convert("Europe/Warsaw").strftime("%Y-%m-%d %H:%M")
+
+            rows.append({
+                "Para": pair,
+                "Interwał": itv,
+                "RSI": round(float(rsi), 2) if rsi is not None else None,
+                "Formacja": pattern if pattern != "NONE" else "",
+                "Sygnał": signal if signal else "",
+                "Godzina": ts_str,
+            })
+    df_out = pd.DataFrame(rows)
+    return df_out
+
+signals_df = build_signals(PAIRS, INTERVALS)
+
+if show_only_signals:
+    view_df = signals_df[signals_df["Sygnał"] != ""].copy()
+else:
+    view_df = signals_df.copy()
+
+st.subheader("📈 Sygnały (RSI + formacja)")
+if view_df.empty:
+    st.info("Brak aktywnych sygnałów dla wybranych ustawień.")
+else:
+    # Dodaj przyciski „Szczegóły” dla każdej pary (ostatni wiersz per para)
+    # Aby nie mnożyć przycisków przy wielu interwałach, pokaż przycisk w każdej linii.
+    def _detail_key(idx: int) -> str:
+        return f"details_{idx}"
+
+    # render
+    for i, row in view_df.reset_index(drop=True).iterrows():
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1.3, 0.7, 0.7, 1.2, 1, 1.2, 0.9])
+        c1.write(f"**{row['Para']}**")
+        c2.write(row["Interwał"])
+        c3.write(row["RSI"] if row["RSI"] is not None else "—")
+        c4.write(row["Formacja"] or "—")
+        c5.write(f"**{row['Sygnał']}**" if row["Sygnał"] else "—")
+        c6.write(row["Godzina"] or "—")
+        if c7.button("Szczegóły", key=_detail_key(i)):
+            st.session_state["detail_pair"] = row["Para"]
+            st.session_state["detail_interval"] = row["Interwał"]
+            st.session_state["detail_time"] = row["Godzina"]
+            st.rerun()
+
+# ----------- Szczegóły instrumentu -----------
+
+def render_details():
+    pair = st.session_state.get("detail_pair")
+    itv = st.session_state.get("detail_interval", "60m")
+    if not pair:
+        return
+    st.divider()
+    st.subheader(f"🔎 Szczegóły: {pair} ({itv})")
+
+    df = fetch_ohlc(pair, yf_interval=itv, period="7d")
+    if df is None or df.empty:
+        st.warning("Brak danych do podglądu wykresu.")
+        return
+
+    # mini-wykres
+    chart = df["Close"].rename("Kurs")
+    st.line_chart(chart)
+
+    # ostatnie 10 świec
+    st.markdown("**Ostatnie 10 świec (OHLC):**")
+    st.dataframe(df.tail(10))
+
+    # związane newsy
+    if fetch_all_news:
+        with st.spinner("Pobieram newsy i przypisuję do instrumentów…"):
+            items = fetch_all_news(supported_symbols=[pair], per_feed_limit=30)
+        st.markdown("### 📰 Przypięte newsy")
+        if not items:
+            st.write("Brak bieżących wiadomości dla tego symbolu.")
+        else:
+            for it in items[:10]:
+                sent = score_sentiment(f"{it['title']} {it.get('summary','')}")
+                badge = "🟢" if sent >= 0.2 else "🔴" if sent <= -0.2 else "🟡"
+                ts = it["published"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                st.markdown(
+                    f"{badge} **[{it['title']}]({it['link']})**  "
+                    f"<small>({it['source']} • {ts})</small>",
+                    unsafe_allow_html=True
+                )
+                if it.get("summary"):
+                    st.caption(it["summary"])
+
+if "detail_pair" in st.session_state:
+    render_details()
+
+# ----------- NEWS agregacja globalna -----------
+
+st.divider()
+st.subheader("📰 Ważne wiadomości (Investing, ForexFactory, MarketWatch)")
+
+if fetch_all_news:
+    with st.spinner("Ładowanie newsów…"):
+        all_news = fetch_all_news(supported_symbols=PAIRS, per_feed_limit=20)
+    if not all_news:
+        st.write("Brak świeżych wiadomości.")
     else:
-        df_det = df_det.copy()
-        df_det["RSI"] = compute_rsi(df_det)
-        patt_series = scan_patterns(df_det)
-        last_patt = last_pattern(df_det) or ""
-        last_rsi = float(df_det["RSI"].dropna().iloc[-1]) if not df_det["RSI"].dropna().empty else None
-        signal = evaluate_signal(last_rsi, last_patt, rsi_buy, rsi_sell)
+        # mała lista – top 12
+        for n in all_news[:12]:
+            syms = ", ".join(n.get("symbols") or [])
+            sent = score_sentiment(f"{n['title']} {n.get('summary','')}")
+            badge = "🟢" if sent >= 0.2 else "🔴" if sent <= -0.2 else "🟡"
+            ts = n["published"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            st.markdown(
+                f"{badge} **[{n['title']}]({n['link']})** "
+                f"<small>({n['source']} • {ts}{' • ' + syms if syms else ''})</small>",
+                unsafe_allow_html=True
+            )
+else:
+    st.info("Moduł parsowania newsów jest niedostępny. Upewnij się, że plik **news_parsers.py** znajduje się w repozytorium.")
 
-        st.metric(
-            label=f"{symbol_pick} · {itv_pick}",
-            value=signal,
-            help="Sygnał = formacja + RSI względem progów"
-        )
-        st.write(f"**Ostatnia formacja:** {last_patt or '—'}")
-        st.write(f"**Ostatni RSI:** {round(last_rsi,2) if last_rsi is not None else '—'}")
-
-        st.markdown("#### Ostatnie świeczki")
-        show_n = st.slider("Ile wierszy pokazać:", min_value=20, max_value=300, value=120, step=10)
-        view = df_det.tail(show_n)[["Open", "High", "Low", "Close", "RSI"]].copy()
-        view.index.name = "Time"
-        st.dataframe(view, use_container_width=True)
+# stopka
+st.caption("v1 • dane: Yahoo Finance • RSI + formacje świecowe + przypięte newsy")
