@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from ta.momentum import RSIIndicator
@@ -14,11 +12,10 @@ from fx_symbols import DEFAULT_FX_PAIRS
 from data_fetcher import fetch_series, fetch_df
 
 
-# ============ USTAWIENIA UI / CONFIG ============
+# -------------------- Konfiguracja / pary --------------------
 
 st.set_page_config(page_title="SEP Forex Signals", layout="wide")
 
-# spróbuj doczytać config.json (opcjonalny)
 def _load_pairs_from_config() -> List[str]:
     try:
         with open("config.json", "r", encoding="utf-8") as f:
@@ -30,23 +27,19 @@ def _load_pairs_from_config() -> List[str]:
         pass
     return DEFAULT_FX_PAIRS
 
-
 PAIRS: List[str] = _load_pairs_from_config()
 
 
-# ============ POMOCNICZE ============
+# -------------------- Pomocnicze --------------------
 
 def compute_rsi(series: pd.Series, window: int) -> float | None:
-    """Liczy RSI; zwraca float albo None przy braku danych."""
+    """Zwraca ostatnią wartość RSI albo None, gdy brak danych."""
     try:
         if series is None or series.empty:
             return None
         ser = series.astype("float64")
-        rsi = RSIIndicator(close=ser, window=window).rsi()
-        rsi = rsi.dropna()
-        if rsi.empty:
-            return None
-        return float(rsi.iloc[-1])
+        rsi = RSIIndicator(close=ser, window=window).rsi().dropna()
+        return None if rsi.empty else float(rsi.iloc[-1])
     except Exception:
         return None
 
@@ -61,14 +54,13 @@ def build_signal(rsi_val: float | None, rsi_buy: float, rsi_sell: float) -> str:
     return "—"
 
 
-# ============ SIDEBAR ============
+# -------------------- Sidebar --------------------
 
 st.sidebar.header("Ustawienia strategii")
 rsi_buy = st.sidebar.number_input("Próg RSI dla KUP (≤)", value=30, step=1)
 rsi_sell = st.sidebar.number_input("Próg RSI dla SPRZEDAJ (≥)", value=70, step=1)
 rsi_window = st.sidebar.number_input("Okres RSI", value=14, step=1, min_value=2)
 
-# interwały wybieramy z listy – takie, które yfinance wspiera intraday
 intervals = st.sidebar.multiselect(
     "Interwały",
     options=["15m", "30m", "60m"],
@@ -79,24 +71,24 @@ only_active = st.sidebar.checkbox("Pokaż tylko wiersze z aktywnym sygnałem", v
 st.title("📈 SEP Forex Signals")
 st.caption("Analiza RSI + wykresy (dane: Yahoo Finance)")
 
-# ============ TABELA SYGNAŁÓW ============
+
+# -------------------- Tabela sygnałów --------------------
 
 def build_table(pairs: Iterable[str], intervals: Iterable[str]) -> pd.DataFrame:
     rows: List[Tuple[str, str, float | None, str, float | None, pd.Timestamp | None]] = []
     for sym in pairs:
         for itv in intervals:
-            ser = fetch_series(sym, period="5d", interval=itv)
+            # => dłuższy period, żeby RSI zawsze miało wystarczająco danych
+            ser = fetch_series(sym, period="7d", interval=itv)
             last_px = float(ser.dropna().iloc[-1]) if not ser.empty else None
             last_ts = ser.dropna().index[-1] if not ser.empty else None
             rsi_val = compute_rsi(ser, window=int(rsi_window))
             sig = build_signal(rsi_val, rsi_buy, rsi_sell)
             rows.append((sym, itv, rsi_val, sig, last_px, last_ts))
 
-    df = pd.DataFrame(
-        rows,
-        columns=["Symbol", "Interwał", "RSI", "Sygnał", "Cena", "Czas"],
+    return pd.DataFrame(
+        rows, columns=["Symbol", "Interwał", "RSI", "Sygnał", "Cena", "Czas"]
     )
-    return df
 
 
 with st.spinner("Odświeżam dane..."):
@@ -105,15 +97,11 @@ with st.spinner("Odświeżam dane..."):
 if only_active:
     table_df = table_df[table_df["Sygnał"].isin(["BUY", "SELL"])]
 
-st.dataframe(
-    table_df,
-    use_container_width=True,
-    hide_index=True,
-)
-
+st.dataframe(table_df, use_container_width=True, hide_index=True)
 st.markdown("---")
 
-# ============ SZCZEGÓŁY (WYKRES) ============
+
+# -------------------- Szczegóły / wykres --------------------
 
 st.subheader("Szczegóły")
 sel = st.selectbox(
@@ -123,26 +111,21 @@ sel = st.selectbox(
 )
 
 if sel and not table_df.empty:
-    # parsuj wybór
     sym, itv = sel.split(" × ", 1)
 
-    # pobierz pełny DF (nie Series), żeby mieć OHLC na wykres/analizy
-    df_full = fetch_df(sym, period="5d", interval=itv)
+    # pełny DF (OHLC) – ale do wykresu podamy Series, żeby uniknąć KeyError
+    df_full = fetch_df(sym, period="7d", interval=itv)
 
     if df_full.empty or "Close" not in df_full.columns:
         st.info("Brak danych do wykresu.")
     else:
-        # przygotuj dane pod wykres liniowy
-        ch_df = df_full[["Close"]].rename(columns={"Close": sym})
-        ch_df.index.name = "time"
+        # >>> kluczowa zmiana: przekazujemy Series, nie DataFrame
+        st.line_chart(df_full["Close"].rename(sym), use_container_width=True)
 
-        st.line_chart(ch_df, use_container_width=True)
-
-        # dodatkowo – aktualny RSI na tym interwale
         last_rsi = compute_rsi(df_full["Close"], window=int(rsi_window))
-        met1, met2, met3 = st.columns(3)
-        met1.metric("RSI", "—" if last_rsi is None else f"{last_rsi:.2f}")
-        met2.metric("Cena", f"{float(df_full['Close'].iloc[-1]):.5f}")
-        met3.metric("Ostatnia świeca", str(df_full.index[-1]))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RSI", "—" if last_rsi is None else f"{last_rsi:.2f}")
+        c2.metric("Cena", f"{float(df_full['Close'].iloc[-1]):.5f}")
+        c3.metric("Ostatnia świeca", str(df_full.index[-1]))
 else:
     st.info("Wybierz symbol z listy powyżej, aby zobaczyć szczegóły.")
