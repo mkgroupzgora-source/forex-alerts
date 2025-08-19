@@ -113,19 +113,21 @@ sel = st.selectbox(
 if sel and not table_df.empty:
     sym, itv = sel.split(" × ", 1)
 
-    # pełny DF (OHLC) – ale do wykresu podamy Series, żeby uniknąć KeyError
     df_full = fetch_df(sym, period="7d", interval=itv)
 
     if df_full.empty or "Close" not in df_full.columns:
         st.info("Brak danych do wykresu.")
     else:
-        # >>> kluczowa zmiana: przekazujemy Series, nie DataFrame
-        st.line_chart(df_full["Close"].rename(sym), use_container_width=True)
+        # >>> klucz: nie .rename(sym)! Ustawiamy nazwę serii wprost
+        ser = pd.to_numeric(df_full["Close"], errors="coerce").dropna().copy()
+        ser.name = sym
 
-        last_rsi = compute_rsi(df_full["Close"], window=int(rsi_window))
+        st.line_chart(ser, use_container_width=True)
+
+        last_rsi = compute_rsi(ser, window=int(rsi_window))
         c1, c2, c3 = st.columns(3)
         c1.metric("RSI", "—" if last_rsi is None else f"{last_rsi:.2f}")
-        c2.metric("Cena", f"{float(df_full['Close'].iloc[-1]):.5f}")
-        c3.metric("Ostatnia świeca", str(df_full.index[-1]))
+        c2.metric("Cena", f"{float(ser.iloc[-1]):.5f}")
+        c3.metric("Ostatnia świeca", str(ser.index[-1]))
 else:
     st.info("Wybierz symbol z listy powyżej, aby zobaczyć szczegóły.")
