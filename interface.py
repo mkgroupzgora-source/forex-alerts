@@ -1,324 +1,390 @@
 # interface.py
-from __future__ import annotations
+# SEP Forex Signals – RSI + formacje świecowe
+# Źródła: Yahoo (opóźnione) lub lokalny MT5 (opcjonalnie).
+# Autor: (Twoje)
 
+from __future__ import annotations
 import math
-from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import streamlit as st
-import matplotlib.pyplot as plt
 
-# opcjonalnie ładne świece
+# wykres świecowy
+import mplfinance as mpf
+
+# dane Yahoo
+import yfinance as yf
+
+# ====== Opcjonalny MT5 (lokalnie) ======
+MT5_AVAILABLE = False
 try:
-    import mplfinance as mpf
-    _HAS_MPF = True
+    from mt5_handler import mt5_fetch_ohlc  # funkcja opcjonalna w Twoim repo
+    MT5_AVAILABLE = True
 except Exception:
-    _HAS_MPF = False
+    MT5_AVAILABLE = False
 
-# MT5 handler (lokalnie)
+# ====== Symbole ======
 try:
-    import mt5_handler as mt5h
+    # opcjonalny moduł z Twojego repo (jeśli jest)
+    from fx_symbols import SYMBOLS_YF
 except Exception:
-    mt5h = None
+    # Rezerwowa lista – możesz rozszerzyć
+    SYMBOLS_YF = [
+        "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "USDCAD=X",
+        "XAUUSD=X", "XAGUSD=X"  # złoto/srebro (czasem Yahoo zwraca XAGUSD=X)
+    ]
 
-st.set_page_config(page_title="SEP Forex Signals — RT via MT5", layout="wide")
-st.title("📈 SEP Forex Signals")
-st.caption("RSI + formacje świecowe • Źródło danych: Yahoo (opóźnione) lub MT5 (real‑time, lokalnie)")
+# ====== Ustawienia strony ======
+st.set_page_config(page_title="SEP Forex Signals", layout="wide")
 
-# ====== LISTA SYMBOLI (Yahoo tickery) ======
-SYMBOLS: List[str] = [
-    "EURUSD=X", "GBPUSD=X", "USDCHF=X", "USDJPY=X", "USDCNH=X", "USDRUB=X",
-    "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDSEK=X", "USDPLN=X",
-    "AUDCAD=X", "AUDCHF=X", "AUDJPY=X", "AUDNZD=X", "AUDPLN=X",
-    "CADCHF=X", "CADJPY=X", "CADPLN=X",
-    "CHFJPY=X", "CHFPLN=X", "CNHJPY=X",
-    "EURAUD=X", "EURCAD=X", "EURCHF=X", "EURCNH=X", "EURGBP=X",
-    "EURJPY=X", "EURNZD=X", "EURPLN=X",
-    "GBPAUD=X", "GBPCAD=X", "GBPCHF=X", "GBPJPY=X", "GBPPLN=X",
-    "XAGUSD=X", "XAUUSD=X", "XPDUSD=X", "XPTUSD=X"
-]
-INTERVALS = ["15m", "30m", "60m"]
+# ====== Pomocnicze ===========================================================
 
-# ====== Alias symboli Yahoo -> MT5 (zmień jeśli broker używa sufiksów) ======
-# np. "EURUSD=X": "EURUSD", "XAUUSD=X": "XAUUSD."
-SYMBOL_ALIAS: Dict[str, str] = {
-    # waluty
-    "EURUSD=X": "EURUSD",
-    "GBPUSD=X": "GBPUSD",
-    "USDCHF=X": "USDCHF",
-    "USDJPY=X": "USDJPY",
-    "USDCAD=X": "USDCAD",
-    "USDPLN=X": "USDPLN",
-    "EURPLN=X": "EURPLN",
-    # metale – zmień na nazwę u brokera, np. "XAUUSD"
-    "XAUUSD=X": "XAUUSD",
-    "XAGUSD=X": "XAGUSD",
-    "XPTUSD=X": "XPTUSD",  # Platinum
-    "XPDUSD=X": "XPDUSD",  # Palladium
-    # dodawaj kolejne w razie potrzeby...
-}
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Prosta implementacja RSI (bez ta-lib)."""
+    series = series.astype(float)
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-# ================== POBIERANIE DANYCH ==================
+    # Wykładnicze średnie
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
-@st.cache_data(ttl=60, show_spinner=False)
-def yf_ohlc(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    """OHLC z Yahoo (opóźnione ~15 min)."""
-    try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        return df[keep].dropna()
-    except Exception:
-        return pd.DataFrame()
-
-def rt_ohlc_mt5(symbol_yf: str, interval: str, bars: int = 500) -> pd.DataFrame:
-    """OHLC z MT5 (real‑time) — wymaga uruchomionego terminala i poprawnego symbolu."""
-    if mt5h is None or not mt5h.is_available():
-        return pd.DataFrame()
-    symbol_mt5 = SYMBOL_ALIAS.get(symbol_yf, symbol_yf.replace("=X", ""))  # prosta normalizacja
-    return mt5h.get_ohlc(symbol_mt5, interval=interval, bars=bars)
-
-# ================== RSI + FORMACJE ==================
-
-def rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
-    c = pd.to_numeric(close, errors="coerce").dropna()
-    if c.size < period + 1:
-        return pd.Series(index=close.index, dtype=float)
-    delta = c.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    alpha = 1.0 / period
-    avg_gain = gain.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=alpha, adjust=False, min_periods=period).mean().replace(0, 1e-12)
     rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi.reindex(close.index)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
 
-def _body(o, c): return abs(c - o)
-def _upper(o, h, c): return h - max(o, c)
-def _lower(o, l, c): return min(o, c) - l
 
-def detect_last_pattern(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+def _clean_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Porządkuje dane pod wykresy i obliczenia."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Yahoo potrafi zwrócić kolumny wielopoziomowe – spłaszczamy jeśli trzeba
+    if isinstance(df.columns, pd.MultiIndex):
+        # spróbujmy znaleźć ('Close', '') etc.
+        df = df.copy()
+        df.columns = ['_'.join([c for c in col if c]) for col in df.columns.values]
+        rename_map = {
+            "Open": "Open", "High": "High", "Low": "Low", "Close": "Close", "Adj Close": "Adj Close", "Volume":"Volume",
+            "Open_": "Open", "High_": "High", "Low_": "Low", "Close_": "Close", "Adj Close_": "Adj Close", "Volume_":"Volume",
+            "Open_EURUSD=X": "Open", "High_EURUSD=X": "High", "Low_EURUSD=X": "Low", "Close_EURUSD=X": "Close",
+        }
+        for k, v in list(rename_map.items()):
+            if k in df.columns:
+                df.rename(columns={k: v}, inplace=True)
+
+    # Zachowujemy standardowy zestaw
+    cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[cols].copy()
+
+    # indeks jako DatetimeIndex
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception:
+        pass
+
+    # usuwamy wiersze z brakami cen
+    must_have = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+    if must_have:
+        df = df.dropna(subset=must_have)
+
+    # posortuj i usuń duplikaty indexu
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+
+    return df
+
+
+@dataclass
+class PatternResult:
+    name: Optional[str] = None
+    bullish: bool = False
+    bearish: bool = False
+
+
+def detect_candle_pattern(df: pd.DataFrame) -> PatternResult:
+    """
+    Bardzo lekka detekcja kilku formacji na ostatniej świecy:
+    - Bullish Engulfing
+    - Bearish Engulfing
+    - Hammer
+    - Shooting Star
+    Zwraca PatternResult (nazwa + flaga bullish/bearish).
+    """
+    res = PatternResult()
     if df is None or df.empty or len(df) < 2:
-        return None, None
-    o, h, l, c = [df[x].astype(float) for x in ["Open","High","Low","Close"]]
-    i0, i1, i2 = -1, -2, -3
-    # Engulfing
-    if len(df) >= 2:
-        prev_bear = c.iloc[i1] < o.iloc[i1]
-        prev_bull = c.iloc[i1] > o.iloc[i1]
-        bull = (c.iloc[i0] > o.iloc[i0]) and (o.iloc[i0] < c.iloc[i1]) and (c.iloc[i0] > o.iloc[i1]) and prev_bear
-        bear = (c.iloc[i0] < o.iloc[i0]) and (o.iloc[i0] > c.iloc[i1]) and (c.iloc[i0] < o.iloc[i1]) and prev_bull
-        if bull: return "Objęcie Hossy", "bull"
-        if bear: return "Objęcie Bessy", "bear"
-    # Stars
-    if len(df) >= 3:
-        small1 = _body(o.iloc[i1], c.iloc[i1]) < 0.3 * (h.iloc[i1] - l.iloc[i1] + 1e-12)
-        downtrend = c.iloc[i2] < c.iloc[i2-1] if len(df) >= 4 else (c.iloc[i2] < o.iloc[i2])
-        uptrend  = c.iloc[i2] > c.iloc[i2-1] if len(df) >= 4 else (c.iloc[i2] > o.iloc[i2])
-        strong_bull = (c.iloc[i0] > (o.iloc[i2] + c.iloc[i2]) / 2) and (c.iloc[i0] > o.iloc[i0])
-        strong_bear = (c.iloc[i0] < (o.iloc[i2] + c.iloc[i2]) / 2) and (c.iloc[i0] < o.iloc[i0])
-        if downtrend and small1 and strong_bull:
-            return "Gwiazda Poranna", "bull"
-        if uptrend and small1 and strong_bear:
-            return "Gwiazda Wieczorna", "bear"
-    # Hammer / Shooting Star
-    body = _body(o.iloc[i0], c.iloc[i0]); up = _upper(o.iloc[i0], h.iloc[i0], c.iloc[i0]); lo = _lower(o.iloc[i0], l.iloc[i0], c.iloc[i0])
-    if body <= 0.3 * (h.iloc[i0] - l.iloc[i0] + 1e-12):
-        if lo > 2 * body and up < body:  return "Młotek", "bull"
-        if up > 2 * body and lo < body:  return "Spadająca Gwiazda", "bear"
-    # Doji
-    if _body(o.iloc[i0], c.iloc[i0]) <= 0.1 * (h.iloc[i0] - l.iloc[i0] + 1e-12):
-        return "Doji", None
-    return None, None
+        return res
 
-def detect_patterns_all(df: pd.DataFrame) -> pd.DataFrame:
-    out = []
-    if df is None or df.empty: 
-        return pd.DataFrame(columns=["time","pattern","dir","price"])
+    o = df["Open"].astype(float)
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
     c = df["Close"].astype(float)
-    for i in range(1, len(df)):
-        name, direction = detect_last_pattern(df.iloc[:i+1])
-        if name:
-            out.append({"time": df.index[i], "pattern": name, "dir": direction, "price": float(c.iloc[i])})
-    return pd.DataFrame(out)
 
-def decide_signal(rsi_value: Optional[float], pattern_dir: Optional[str], rsi_buy: float, rsi_sell: float) -> str:
+    # ostatnia i poprzednia świeca
+    o1, c1, h1, l1 = o.iloc[-1], c.iloc[-1], h.iloc[-1], l.iloc[-1]
+    o2, c2 = o.iloc[-2], c.iloc[-2]
+
+    body1 = abs(c1 - o1)
+    range1 = (h1 - l1) if (h1 - l1) != 0 else np.nan
+    upper_shadow = h1 - max(c1, o1)
+    lower_shadow = min(c1, o1) - l1
+
+    # Bullish Engulfing: poprzednia świeca spadkowa, obecna wzrostowa i korpus obejmuje poprzedni
+    if (c2 < o2) and (c1 > o1) and (o1 <= c2) and (c1 >= o2):
+        res.name = "Bullish Engulfing"
+        res.bullish = True
+        return res
+
+    # Bearish Engulfing
+    if (c2 > o2) and (c1 < o1) and (o1 >= c2) and (c1 <= o2):
+        res.name = "Bearish Engulfing"
+        res.bearish = True
+        return res
+
+    # Hammer: mały korpus, długi dolny cień
+    if range1 and body1 / range1 < 0.3 and lower_shadow > 2 * body1 and upper_shadow < body1:
+        res.name = "Hammer"
+        res.bullish = True
+        return res
+
+    # Shooting Star: mały korpus, długi górny cień
+    if range1 and body1 / range1 < 0.3 and upper_shadow > 2 * body1 and lower_shadow < body1:
+        res.name = "Shooting Star"
+        res.bearish = True
+        return res
+
+    return res
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_yahoo(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Pobiera OHLC z Yahoo Finance i porządkuje."""
+    df = yf.download(
+        symbol, period=period, interval=interval, progress=False, auto_adjust=True,
+        group_by="column", threads=True
+    )
+    return _clean_ohlc(df)
+
+
+def fetch_data(source: str, symbol: str, interval: str, mt5_login: Optional[str] = None,
+               mt5_server: Optional[str] = None, mt5_password: Optional[str] = None) -> pd.DataFrame:
+    """Pobiera dane z wybranego źródła."""
+    if source == "Yahoo":
+        # dla intra sensownie 7d – 15/30/60m
+        return fetch_yahoo(symbol, period="7d", interval=interval)
+
+    # MT5 (opcjonalnie lokalnie)
+    if source == "MT5":
+        if not MT5_AVAILABLE:
+            st.info("MT5: moduł lokalny niedostępny (mt5_handler). Pozostaję przy Yahoo.")
+            return pd.DataFrame()
+        try:
+            df = mt5_fetch_ohlc(symbol=symbol, timeframe=interval, login=mt5_login,
+                                server=mt5_server, password=mt5_password)
+            return _clean_ohlc(df)
+        except Exception as e:
+            st.warning(f"MT5: problem z pobraniem {symbol}/{interval}: {e}")
+            return pd.DataFrame()
+
+    return pd.DataFrame()
+
+
+def last_safe(series: pd.Series) -> Optional[float]:
+    if series is None or series.empty:
+        return None
+    val = series.dropna()
+    if val.empty:
+        return None
+    try:
+        return float(val.iloc[-1])
+    except Exception:
+        return None
+
+
+def decide_signal(rsi_value: Optional[float], pattern: PatternResult,
+                  rsi_buy_thr: float, rsi_sell_thr: float) -> Optional[str]:
+    """Sygnal generowany tylko przy zgodności RSI + formacji."""
     if rsi_value is None or math.isnan(rsi_value):
-        return "—"
-    if pattern_dir == "bull" and rsi_value <= rsi_buy:
-        return "🟢 KUP"
-    if pattern_dir == "bear" and rsi_value >= rsi_sell:
-        return "🔴 SPRZEDAJ"
-    return "—"
+        return None
 
-# ================== SIDEBAR: USTAWIENIA ==================
+    # BUY: RSI < próg kupna i formacja bycza
+    if rsi_value <= rsi_buy_thr and pattern.bullish:
+        return "BUY"
+    # SELL: RSI > próg sprzedaży i formacja niedźwiedzia
+    if rsi_value >= rsi_sell_thr and pattern.bearish:
+        return "SELL"
+
+    return None
+
+
+def plot_candles_mpf(df: pd.DataFrame, pattern: PatternResult, title: str = ""):
+    """Wykres świecowy przy użyciu mplfinance. Zabezpieczenia przed błędami."""
+    if df is None or df.empty:
+        st.info("Brak danych do wykresu.")
+        return
+
+    # bezpieczeństwo: wymagane kolumny
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in df.columns:
+            st.info("Brak wymaganych kolumn OHLC do wykresu.")
+            return
+
+    # czyszczenie
+    dfp = df.copy()
+    dfp.index = pd.to_datetime(dfp.index)
+    dfp = dfp.dropna(subset=["Open", "High", "Low", "Close"])
+    if dfp.empty:
+        st.info("Brak niepustych świec do wykresu.")
+        return
+
+    # ogranicz wykres do ~200 ostatnich świec dla czytelności
+    if len(dfp) > 200:
+        dfp = dfp.iloc[-200:]
+
+    # rysuj
+    try:
+        mpf.plot(
+            dfp,
+            type="candle",
+            style="charles",
+            volume=False,
+            figratio=(10, 5),
+            title=title or "",
+            mav=(7, 14)  # proste średnie, lepsza czytelność
+        )
+        st.pyplot(mpf.gcf(), clear_figure=True, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Nie udało się narysować wykresu: {e}")
+
+
+# ====== UI ===================================================================
 
 with st.sidebar:
-    source = st.radio("Źródło danych", ["Yahoo (opóźnione)", "MT5 (real‑time, lokalnie)"], index=0)
-    rsi_buy = st.number_input("Próg RSI dla KUP (≤)", value=30, step=1, min_value=1, max_value=99)
-    rsi_sell = st.number_input("Próg RSI dla SPRZEDAJ (≥)", value=70, step=1, min_value=1, max_value=99)
-    rsi_period = st.number_input("Okres RSI", value=14, step=1, min_value=2, max_value=200)
-    intervals = st.multiselect("Interwały", options=INTERVALS, default=INTERVALS)
+    st.markdown("### Źródło danych")
+    source = st.radio("",
+                      options=["Yahoo (opóźnione)", "MT5 (real-time, lokalnie)"],
+                      index=0,
+                      label_visibility="collapsed")
+    if source.startswith("Yahoo"):
+        source_key = "Yahoo"
+    else:
+        source_key = "MT5"
+
+    st.markdown("---")
+    rsi_buy = st.number_input("Próg RSI dla KUP (≤)", min_value=1, max_value=99, value=30, step=1)
+    rsi_sell = st.number_input("Próg RSI dla SPRZEDAJ (≥)", min_value=1, max_value=99, value=70, step=1)
+    rsi_period = st.number_input("Okres RSI", min_value=2, max_value=100, value=14, step=1)
+
+    intervals = st.multiselect("Interwały", options=["15m", "30m", "60m"], default=["15m", "30m", "60m"])
     only_active = st.checkbox("Pokaż tylko wiersze z aktywnym sygnałem", value=False)
 
-    # Panel połączenia MT5 (tylko gdy wybrano MT5)
-    if source.startswith("MT5"):
+    # Pola MT5 (opcjonalnie lokalnie)
+    mt5_login = mt5_server = mt5_password = None
+    if source_key == "MT5":
         st.markdown("---")
-        st.caption("Połącz z MT5 (lokalnie na Windows):")
-        login = st.text_input("Login (numer)", value="", placeholder="np. 1234567")
-        server = st.text_input("Server", value="", placeholder="np. XTB-Demo")
-        password = st.text_input("Hasło", value="", type="password")
-        colA, colB = st.columns(2)
-        connect_clicked = colA.button("🔌 Połącz z MT5")
-        disconnect_clicked = colB.button("❌ Rozłącz MT5")
+        st.caption("Połącz z MT5 (lokalnie na Windows)")
+        mt5_login = st.text_input("Login (numer)")
+        mt5_server = st.text_input("Server (np. XTB Demo)")
+        mt5_password = st.text_input("Hasło", type="password")
 
-        if "mt5_connected" not in st.session_state:
-            st.session_state.mt5_connected = False
 
-        if connect_clicked:
-            ok = (mt5h is not None and mt5h.initialize(
-                login=int(login) if login.strip().isdigit() else None,
-                password=password or None,
-                server=server or None,
-                path_terminal=None  # zostaw puste, jeśli MT5 jest w standardowej lokalizacji
-            ))
-            st.session_state.mt5_connected = bool(ok)
-            st.toast("Połączono z MT5 ✅" if ok else "Nie udało się połączyć z MT5 ❌", icon="✅" if ok else "❌")
+st.title("🧠 SEP Forex Signals")
+st.caption("RSI + formacje świecowe • Źródło danych: Yahoo (opóźnione) lub MT5 (real-time, lokalnie)")
 
-        if disconnect_clicked and mt5h is not None:
-            mt5h.shutdown()
-            st.session_state.mt5_connected = False
-            st.toast("Rozłączono z MT5", icon="📴")
+# ====== Budowa tabeli z sygnałami ============================================
 
-# Autoodświeżanie w trybie MT5 (np. co 5 sekund)
-if source.startswith("MT5"):
-    st.experimental_rerun  # no-op (tylko info dla lintera)
-    st.autorefresh = st.experimental_rerun  # retro-compat alias
-    st.experimental_set_query_params(rt="1")  # aby nie buforował URLa
-    st_autoref = st.experimental_rerun  # alias
-    st.write("")  # placeholder, nic nie robi
-    st.experimental_memo.clear()  # nic krytycznego — odśwież cache
-    st_autorefresh = st.empty()
-    st_autorefresh = st.autorefresh if hasattr(st, "autorefresh") else None
-    if hasattr(st, "autorefresh"):
-        st.autorefresh(interval=5000, key="mt5-autorefresh", rerun=True)
+rows: List[Dict] = []
 
-if not intervals:
-    st.info("Wybierz przynajmniej jeden interwał z lewej.")
-    st.stop()
-
-# ================== TABELA ==================
-
-rows = []
-for sym in SYMBOLS:
+for sym in SYMBOLS_YF:
     for itv in intervals:
-        if source.startswith("MT5") and mt5h is not None and st.session_state.get("mt5_connected", False):
-            df = rt_ohlc_mt5(sym, interval=itv, bars=500)
-        else:
-            df = yf_ohlc(sym, period="7d", interval=itv)
-
-        if df.empty or "Close" not in df.columns:
-            rows.append({"Symbol": sym, "Interwał": itv, "RSI": "—", "Formacja": "—", "Sygnał": "—", "Cena": "—", "Czas": "—", "_df": pd.DataFrame(), "_pats": pd.DataFrame()})
+        df = fetch_data(source_key, sym, itv, mt5_login, mt5_server, mt5_password)
+        if df is None or df.empty:
+            rows.append({
+                "Symbol": sym, "Interwał": itv, "RSI": None, "Formacja": None,
+                "Sygnał": None, "Cena": None, "Czas": None, "_df": None
+            })
             continue
 
-        rsi = rsi_series(df["Close"], period=rsi_period)
-        rsi_last = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else None
-        patt_name, patt_dir = detect_last_pattern(df)
-        signal = decide_signal(rsi_last, patt_dir, rsi_buy, rsi_sell)
+        # RSI
+        r = rsi(df["Close"], period=rsi_period)
+        r_last = last_safe(r)
+
+        # Formacja (na ostatniej świecy)
+        patt = detect_candle_pattern(df)
+
+        # sygnał tylko przy zgodności RSI + formacji
+        sig = decide_signal(r_last, patt, rsi_buy, rsi_sell)
+
+        # cena i czas
+        price = last_safe(df["Close"])
+        ts = None
+        if not df.empty:
+            ts = df.index[-1]
 
         rows.append({
             "Symbol": sym,
             "Interwał": itv,
-            "RSI": "—" if rsi_last is None else round(rsi_last, 2),
-            "Formacja": patt_name if patt_name else "—",
-            "Sygnał": signal,
-            "Cena": float(df["Close"].iloc[-1]),
-            "Czas": df.index[-1],
-            "_df": df,
-            "_pats": detect_patterns_all(df)
+            "RSI": None if r_last is None else round(float(r_last), 2),
+            "Formacja": patt.name if patt.name else None,
+            "Sygnał": sig,
+            "Cena": price,
+            "Czas": ts,
+            "_df": df
         })
 
-tbl = pd.DataFrame(rows, columns=["Symbol","Interwał","RSI","Formacja","Sygnał","Cena","Czas","_df","_pats"])
-if only_active:
-    tbl = tbl[tbl["Sygnał"].isin(["🟢 KUP","🔴 SPRZEDAJ"])]
+df_view = pd.DataFrame(rows)
 
-st.dataframe(tbl.drop(columns=["_df","_pats"]), use_container_width=True, hide_index=True)
+# filtr aktywnych
+if only_active and not df_view.empty:
+    df_view = df_view[df_view["Sygnał"].notna()]
 
-# ================== SZCZEGÓŁY: ŚWIECOWY + MARKERY ==================
+# Porządkowanie i prezentacja
+show_cols = ["Symbol", "Interwał", "RSI", "Formacja", "Sygnał", "Cena", "Czas"]
+st.dataframe(df_view[show_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
 
-st.subheader("Szczegóły")
-if tbl.empty:
-    st.info("Brak wyników do podglądu.")
-    st.stop()
+# ====== Szczegóły + wykres świecowy =========================================
 
-opts = [f"{r.Symbol} × {r.Interwał}" for r in tbl.itertuples(index=False)]
-pick = st.selectbox("Wybierz wiersz", options=opts, index=0)
-sym, itv = [x.strip() for x in pick.split("×")]
+st.markdown("### Szczegóły")
+# wybór wiersza (symbol + interwał)
+if not df_view.empty:
+    options = [f"{r.Symbol} × {r.Interwał}" for r in df_view.itertuples()]
+    choice = st.selectbox("Wybierz wiersz do podglądu", options=options, index=0)
+    # znajdź rekord
+    sym_sel, itv_sel = choice.split(" × ")
+    row_sel = df_view[(df_view["Symbol"] == sym_sel) & (df_view["Interwał"] == itv_sel)]
+    if not row_sel.empty:
+        df_sel: pd.DataFrame = row_sel["_df"].iloc[0]
+        patt_sel = detect_candle_pattern(df_sel)
 
-row = tbl[(tbl["Symbol"] == sym) & (tbl["Interwał"] == itv)].iloc[0]
-df_sel: pd.DataFrame = row["_df"]
-pat_sel: pd.DataFrame = row["_pats"]
+        # podsumowanie
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Symbol", sym_sel)
+        with c2:
+            st.metric("Interwał", itv_sel)
+        with c3:
+            st.metric("Formacja", patt_sel.name if patt_sel.name else "—")
 
-def plot_candles_mpf(df: pd.DataFrame, pats: pd.DataFrame, title: str):
-    ap = []
-    if pats is not None and not pats.empty:
-        bulls = pats[pats["dir"] == "bull"]
-        bears = pats[pats["dir"] == "bear"]
-        if not bulls.empty:
-            ap.append(mpf.make_addplot(bulls.set_index("time")["price"], type="scatter", markersize=80, marker="^", color="g"))
-        if not bears.empty:
-            ap.append(mpf.make_addplot(bears.set_index("time")["price"], type="scatter", markersize=80, marker="v", color="r"))
-    fig, axlist = mpf.plot(
-        df, type="candle", style="charles", addplot=ap, returnfig=True, figsize=(10, 5),
-        title=title, volume=False
-    )
-    st.pyplot(fig, clear_figure=True)
+        # wykres
+        st.markdown("#### Wykres świecowy")
+        plot_candles_mpf(df_sel, patt_sel, title=f"{sym_sel} • {itv_sel}")
 
-def plot_candles_fallback(df: pd.DataFrame, pats: pd.DataFrame, title: str):
-    o = df["Open"].values; h = df["High"].values; l = df["Low"].values; c = df["Close"].values
-    x = np.arange(len(df)); width = 0.6
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for i in range(len(df)):
-        ax.vlines(x[i], l[i], h[i], color="black", linewidth=1)
-        color = "green" if c[i] >= o[i] else "red"
-        lower = min(o[i], c[i]); height = abs(c[i] - o[i])
-        ax.add_patch(plt.Rectangle((x[i]-width/2, lower), width, max(height, 1e-6), color=color, alpha=0.85))
-    if pats is not None and not pats.empty:
-        pos = {t: i for i, t in enumerate(df.index)}
-        bulls = pats[pats["dir"] == "bull"]; bears = pats[pats["dir"] == "bear"]
-        bx = [pos.get(t) for t in bulls["time"] if t in pos]; by = bulls["price"].tolist()
-        rx = [pos.get(t) for t in bears["time"] if t in pos]; ry = bears["price"].tolist()
-        if bx and by: ax.scatter(bx, by, marker="^", s=80, color="green", label="Formacja wzrostowa")
-        if rx and ry: ax.scatter(rx, ry, marker="v", s=80, color="red",   label="Formacja spadkowa")
-        if (bx and by) or (rx and ry): ax.legend(loc="best", fontsize=8)
-    ax.set_title(title); ax.grid(True, alpha=0.25); ax.set_xlim(-0.5, len(df)-0.5)
-    st.pyplot(fig, clear_figure=True)
+# ====== Kolorowanie sygnału ==================================================
 
-if df_sel.empty:
-    st.info("Brak danych do wykresu.")
-else:
-    title = f"{sym} • {itv} • {'MT5' if source.startswith('MT5') and st.session_state.get('mt5_connected', False) else 'Yahoo'}"
-    if _HAS_MPF: plot_candles_mpf(df_sel, pat_sel, title)
-    else:        plot_candles_fallback(df_sel, pat_sel, title)
+# (streamlit dataframe nie ma natywnego warunkowego kolorowania pojedynczego pola,
+# więc sygnał pokolorujemy w HTML, a dla prostoty pozostawiamy plain text w tabeli powyżej)
+# Na żądanie można przejść na st.data_editor z kolumną stylowaną.
 
-    close = pd.to_numeric(df_sel["Close"], errors="coerce").dropna()
-    last_rsi_val = rsi_series(close).dropna()
-    last_rsi_val = float(last_rsi_val.iloc[-1]) if not last_rsi_val.empty else None
-    c1, c2, c3 = st.columns(3)
-    c1.metric("RSI (ostatnia)", "—" if last_rsi_val is None else f"{last_rsi_val:.2f}")
-    c2.metric("Cena (Close)", f"{float(close.iloc[-1]):.6f}")
-    c3.metric("Ostatnia świeca", str(close.index[-1]))
 
-    st.markdown("**Ostatnie formacje (z widocznego zakresu)**")
-    if pat_sel is not None and not pat_sel.empty:
-        view = pat_sel.sort_values("time", ascending=False).head(12)
-        view["time"] = view["time"].astype(str)
-        st.dataframe(view.rename(columns={"time":"Czas","pattern":"Formacja","dir":"Kierunek","price":"Cena"}), use_container_width=True, hide_index=True)
-    else:
-        st.info("Brak wykrytych formacji.")
+# ====== Akcje pomocnicze =====================================================
+
+st.caption("v1.3 • Dane: Yahoo Finance (opóźnione) / MT5 lokalnie (jeśli dostępny).")
+
+# Zamiennik starego experimental_rerun (jeśli kiedyś używałeś)
+def _rerun_safe():
+    try:
+        st.rerun()
+    except Exception:
+        pass
